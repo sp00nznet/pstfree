@@ -3,10 +3,11 @@
 Read, export and repair Outlook `.pst` and `.ost` files on Windows. No Outlook
 required, no licence, no per-mailbox fee, no fake progress bar. MIT licensed.
 
-**Status: it gets your mail out.** Folder tree, message list, every property on any node,
-and `--export` writes the whole mailbox to `.eml` files any mail client will open — out of
-PST and OST alike, including from a password-protected PST without ever asking for the
-password. Repair beyond the truncation case is still ahead. See [Progress](#progress).
+**Status: it gets your mail out, and it does not need the file to be intact.** Folder tree,
+message list, every property on any node, and `--export` to `.eml` files any mail client
+will open — from PST and OST alike, including from a password-protected PST without ever
+asking for the password. **Delete both of a PST's B-tree roots and it still recovers every
+message, byte for byte.** See [Progress](#progress).
 
 Sibling project to [vncfree](https://github.com/sp00nznet/vncfree), same attitude:
 find the Windows payware, read the published spec it is hiding behind, give it away.
@@ -215,6 +216,62 @@ mail.
 
 `--nodes` and `--blocks` dump the two B-trees entry by entry.
 
+### When the index is gone
+
+This is the part the money is charged for, and the part no free tool does.
+
+A PST dies by losing its index. One bad page high in a B-tree orphans everything beneath
+it, and `scanpst.exe` — the free Inbox Repair Tool, which leaves with classic Outlook in
+2029 — gives up. So does every other free option.
+
+Here is a 271,360-byte PST with **both** B-tree root pages overwritten with zeroes, which
+is as dead as `scanpst` can describe:
+
+```
+> pstfree.exe torn.pst --list
+Block index unreadable. Carved 184 blocks out of the file itself, plus 0 from surviving index pages.
+Node index unreadable. Swept 128 nodes from 27 surviving pages.
+
+date              folder        from        subject
+2016-08-02 00:27  Calendar      Unknown     Test appointment  [22533 bytes]
+2014-05-25 13:58  Contacts      Unknown     test dist list  [1164 bytes]
+2014-05-25 13:58  Contacts      Unknown     contact name 1  [953 bytes]
+```
+
+Every message, every folder, the same 128 nodes pointing at the same data as the intact
+file. `--export` then writes them all out. There is a test that asserts exactly this: tear
+the roots out of a real PST and compare the recovered node table against the original,
+entry for entry.
+
+It works because nothing in a PST needs the index to be found:
+
+- **Index pages are checksummed and sit at fixed offsets.** Sweeping the file finds every
+  surviving B-tree leaf without following a single pointer, and a page that matches its own
+  checksum is a page rather than a coincidence.
+- **Blocks are checksummed too, and carry their own length and id in a trailer at a fixed
+  distance from an aligned boundary.** So the block index can be rebuilt from the *blocks*,
+  with no index involved anywhere. That is the last resort, and the strongest one — it
+  cannot be fooled into inventing a block, because a candidate is only accepted when the
+  checksum matches the bytes in front of it.
+
+**Recovery has to choose between old and new copies**, because a PST frees pages by
+unlinking them and leaving the bytes alone — so a sweep keeps finding superseded entries.
+Two rules settle it, and both were arrived at by checking the answer against the same file
+undamaged:
+
+1. A block index entry wins only if the bytes at its offset still identify as that block
+   and match its checksum. Freed entries point at reused space and fail.
+2. Between node entries, the highest block id wins. A PST hands out block ids from a
+   counter that only goes up, so the largest is the most recently written — a far better
+   signal than file position, which only says where the allocator found room. Choosing on
+   position instead silently returned a **15,096-byte** older revision of a message whose
+   real size is **22,533**. That is the difference between recovering your mail and
+   recovering something that used to be your mail.
+
+`--verify` reads every checksum in the file and says what a sweep would recover that the
+index cannot reach. `--salvage` on any command ignores the header's index and rebuilds,
+for when it is intact but wrong.
+
 ### It does not stop at the first bad byte
 
 Cut 40% off the end of a 271,360-byte PST and it recovers **the same 128 nodes and 155
@@ -244,7 +301,7 @@ Password ignored, because there is nothing there to ignore.
 **Export** — `.eml` per message with attachments inline, mirroring the folder tree.
 `.mbox` and `.msg` to follow, and rebuilding a clean `.pst` from a damaged one.
 
-**Repair** — the differentiator, and the only genuinely hard part:
+**Repair** — the differentiator, and the only genuinely hard part. All four now work:
 
 1. Header and B-tree validation with a plain-language report of what's actually wrong.
 2. Rebuild the node and block B-trees from surviving pages when the index is torn.
@@ -287,14 +344,22 @@ promised.
   would be OST-only. Currently labelled as undocumented rather than guessed at.
 - **Encrypted OST.** Per MS-PST the encoding modes are keyless, but Microsoft 365 profiles
   can restrict a local cache in ways this repo hasn't tested. Needs a real sample.
-- **How far past `scanpst.exe` can a rebuild actually get?** Truncation is the easy damage
-  case and it already works. A torn B-tree is the real test and is not written yet.
-- **Page and block CRCs** need the table from MS-PST 5.3. Structure and block identity are
-  checked already, which catches a torn index; the CRC is what tells "wrong page" apart
-  from "right page, rotten bytes", so the repair pass will want it.
+- **Recovery has only ever been tested against damage this repo inflicted itself.** Zeroed
+  root pages and a truncated tail are realistic failures, but they are clean ones. Files
+  ruined by a failing disk, a half-finished write or a bad network share fail in messier
+  ways, and none of those have been tried.
+- **A node whose every surviving index entry is stale recovers as an older revision.**
+  Nothing can be done about that — the newer entry is genuinely not in the file any more —
+  but the recovery does not currently say which nodes those were, and it should.
 
 ### Resolved along the way
 
+- **The checksum is ordinary CRC-32 and did not need transcribing at all.** MS-PST 5.3
+  presents it as slicing-by-8 across eight 256-entry tables — eight kilobytes of constants.
+  But the first of those tables is the standard CRC-32 table (polynomial `0xEDB88320`), and
+  the other seven are an optimisation computing the identical function four bytes at a
+  time. So it is generated in ten lines instead, with no initial value and no final
+  inversion, and verified against every page and block in three real files.
 - **The crypt tables are transcribed from MS-PST 5.1 and checked, not trusted.** The
   specification publishes one 768-byte table in three parts. On the way in: 768 values,
   every one within 0–255, each third a permutation of 0–255, and the third the exact
@@ -334,14 +399,14 @@ Updated as things land. Nothing is claimed here until it runs.
 | 3a | The folder tree, with names and message counts | ✅ done |
 | 3b | Subnode trees, message properties, `--list` and `--props` | ✅ done |
 | 4b | Export — `.eml` with MIME, folder tree, attachments | ✅ done |
+| 5b | Every checksum — header, pages, blocks — and `--verify` | ✅ done |
+| 6 | Rebuild torn B-trees by sweeping for surviving leaf pages | ✅ done |
+| 7 | Carve blocks out of the file with no index at all | ✅ done |
 | 3c | Table contexts, for recipients and a second opinion on membership | ⬜ not started |
 | 4c | Export to `.mbox` and `.msg` | ⬜ not started |
-| 5b | Page and block CRCs, to separate wrong pages from rotten ones | ⬜ not started |
-| 6 | Rebuild torn B-trees | ⬜ not started |
-| 7 | Carve orphaned nodes | ⬜ not started |
 | 8 | GUI | ⬜ not started |
 
-27 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
+31 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
 the public fixtures from freepst, fetched by `tests\fetch-fixtures.ps1`. Test files are
 not committed, because real PSTs contain real mail; the tests skip rather than fail when
 they are absent.

@@ -30,12 +30,53 @@ const OFF_FAMAP_VALID: usize = OFF_ROOT + 68;
 const OFF_SENTINEL: usize = 512;
 const OFF_CRYPT_METHOD: usize = 513;
 const HEADER_LEN: usize = 564;
+const OFF_CRC_PARTIAL: usize = 4;
+const OFF_CRC_FULL: usize = 524;
+/// Both header CRCs are computed from wMagicClient onwards.
+const OFF_CRC_RANGE_START: usize = 8;
+const OFF_CRC_PARTIAL_END: usize = OFF_CRC_RANGE_START + 471;
+const OFF_CRC_FULL_END: usize = OFF_CRC_RANGE_START + 516;
 
 const PTYPE_BBT: u8 = 0x80;
 const PTYPE_NBT: u8 = 0x81;
 
 /// A corrupt file must not be able to steer us into a loop or a 400-deep recursion.
 const MAX_BTREE_DEPTH: u32 = 32;
+
+/// A thoroughly rotten file can produce a problem per block. Past this many, the list
+/// stops being a report and starts being a wall, so the rest are counted instead.
+const MAX_WARNINGS: usize = 200;
+
+/// MS-PST's CRC is the ordinary CRC-32 — reflected, polynomial `0xEDB88320` — with no
+/// initial value and no final inversion.
+///
+/// The specification writes it as slicing-by-8 across eight 256-entry tables, which is
+/// the identical function computed four bytes at a time. The first of those tables is the
+/// standard CRC-32 table, so it is generated here rather than transcribed: ten lines
+/// instead of eight kilobytes of constants to get wrong.
+const CRC_TABLE: [u32; 256] = {
+    let mut t = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut k = 0;
+        while k < 8 {
+            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            k += 1;
+        }
+        t[i] = c;
+        i += 1;
+    }
+    t
+};
+
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut c = 0u32;
+    for &b in data {
+        c = CRC_TABLE[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
+    }
+    c
+}
 
 /// Where the fixed structures sit inside a page. The two Unicode variants differ only
 /// here, and only in ways nothing else needs to know about.
@@ -118,6 +159,24 @@ pub struct Node {
     pub nid_parent: u32,
 }
 
+/// What sweeping the file for surviving B-tree leaves turned up.
+#[derive(Default)]
+pub struct Recovered {
+    pub nodes: Vec<Node>,
+    pub blocks: Vec<Block>,
+    pub pages_scanned: u64,
+    pub nbt_pages: usize,
+    pub bbt_pages: usize,
+    /// Pages that look like pages but fail their checksum. These are the losses.
+    pub damaged_pages: usize,
+    /// Entries found more than once, where the copies had to be chosen between. Normal in
+    /// any file that has been written to: freed pages keep their contents.
+    pub superseded: usize,
+    /// Conflicts where no copy could be confirmed against the bytes on disk, so the
+    /// latest was taken on faith. These are the entries most likely to be wrong.
+    pub unresolved: usize,
+}
+
 /// One entry in a node's subnode tree.
 #[derive(Debug, Clone, Copy)]
 pub struct Sub {
@@ -191,6 +250,8 @@ pub struct Pst {
     /// Everything survivable that looked wrong on the way through. This is the seed of
     /// the damage report — the thing the paid tools replace with a progress bar.
     pub warnings: Vec<String>,
+    /// Total problems seen, including any past the listing cap.
+    suppressed: usize,
 }
 
 pub(crate) fn u16le(b: &[u8], o: usize) -> u16 {
@@ -212,6 +273,22 @@ fn bref(b: &[u8], o: usize) -> Bref {
 }
 
 impl Pst {
+    /// Record a problem, capping the list so a thoroughly rotten file gives a report
+    /// rather than a wall of text.
+    fn warn(&mut self, msg: String) {
+        if self.warnings.len() < MAX_WARNINGS {
+            self.warnings.push(msg);
+        } else if self.warnings.len() == MAX_WARNINGS {
+            self.warnings.push(format!("(more than {MAX_WARNINGS} problems; the rest are counted but not listed)"));
+        }
+        self.suppressed += 1;
+    }
+
+    /// How many problems were found in total, listed or not.
+    pub fn problem_count(&self) -> usize {
+        self.suppressed.max(self.warnings.len())
+    }
+
     pub fn open(path: &str) -> Result<Pst, String> {
         let mut file = File::open(path).map_err(|e| format!("{path}: {e}"))?;
         let actual_len = file.metadata().map_err(|e| e.to_string())?.len();
@@ -269,6 +346,21 @@ impl Pst {
             ));
         }
 
+        // Both header CRCs cover runs starting at wMagicClient. If the partial one fails,
+        // the B-tree roots read below cannot be trusted at all, which is exactly the case
+        // where scanning the file beats following them.
+        for (name, stored, range) in [
+            ("partial", u32le(&h, OFF_CRC_PARTIAL), OFF_CRC_RANGE_START..OFF_CRC_PARTIAL_END),
+            ("full", u32le(&h, OFF_CRC_FULL), OFF_CRC_RANGE_START..OFF_CRC_FULL_END),
+        ] {
+            let found = crc32(&h[range]);
+            if found != stored {
+                warnings.push(format!(
+                    "header {name} checksum is 0x{stored:08X} but the bytes give 0x{found:08X} — the header has been altered or damaged"
+                ));
+            }
+        }
+
         let declared_len = u64le(&h, OFF_IB_FILE_EOL);
         if declared_len > actual_len {
             warnings.push(format!(
@@ -292,6 +384,7 @@ impl Pst {
             nbt_root: bref(&h, OFF_BREF_NBT),
             bbt_root: bref(&h, OFF_BREF_BBT),
             bbt: None,
+            suppressed: warnings.len(),
             warnings,
         })
     }
@@ -328,9 +421,18 @@ impl Pst {
                 at.bid
             ));
         }
-        // ponytail: the CRC needs the 256-entry table from MS-PST 5.3. Structure and
-        // identity are checked above, which catches a torn index; add the CRC when the
-        // repair pass needs to tell "wrong page" from "right page, rotten bytes".
+        // The identity check above catches an index pointing at the wrong page. The CRC
+        // catches the other failure: the right page, with rotten bytes inside it. Told
+        // apart because the repair needs to know which - one is a bad pointer, the other
+        // is lost data.
+        let stored = u32le(&buf, t + 4);
+        let found = crc32(&buf[..t]);
+        if stored != found {
+            self.warn(format!(
+                "page at {} fails its checksum (stored 0x{stored:08X}, computed 0x{found:08X}) — its contents are damaged",
+                at.ib
+            ));
+        }
         Ok(buf)
     }
 
@@ -472,7 +574,19 @@ impl Pst {
         } else {
             b.cb as usize
         };
+        let stored_crc = u32le(&buf, t + 4);
         buf.truncate(b.cb as usize);
+
+        // Checked over the bytes as stored, before any decoding, because that is what the
+        // checksum was computed over. A block that fails here is the case no free tool
+        // reports: the index is fine and the data underneath it has rotted.
+        let found_crc = crc32(&buf);
+        if stored_crc != found_crc {
+            self.warn(format!(
+                "block {bid} at offset {} fails its checksum (stored 0x{stored_crc:08X}, computed 0x{found_crc:08X}) — {} bytes of damaged data",
+                b.ib, b.cb
+            ));
+        }
 
         if bid & 2 == 0 {
             match self.crypt {
@@ -589,6 +703,220 @@ impl Pst {
         Ok(out)
     }
 
+    /// Rebuild both indexes by sweeping the file for surviving B-tree leaf pages,
+    /// ignoring the header's roots and every branch page entirely.
+    ///
+    /// This is the part `scanpst.exe` does not do. A torn index is the ordinary way a PST
+    /// dies — one bad page high in the tree orphans everything beneath it — but the leaves
+    /// holding the actual node and block entries are spread across the whole file and are
+    /// almost always still there. Pages sit at fixed offsets and carry a checksum, so they
+    /// can be found without reference to anything that points at them, and a page that
+    /// checksums correctly is a page, not a coincidence.
+    pub fn scan(&mut self) -> Recovered {
+        let mut r = Recovered::default();
+        // Every copy of every entry is kept, with the offset it was found at, and the
+        // conflicts are settled afterwards by checking which copy the bytes agree with.
+        let mut nodes: HashMap<u32, Vec<(u64, Node)>> = HashMap::new();
+        let mut blocks: HashMap<u64, Vec<(u64, Block)>> = HashMap::new();
+
+        let step = self.page.size;
+        let (t, f) = (self.page.trailer, self.page.footer);
+        let mut buf = vec![0u8; step as usize];
+        let mut ib = step; // offset 0 is the header, never a page
+
+        while ib + step <= self.actual_len {
+            r.pages_scanned += 1;
+            if self.file.seek(SeekFrom::Start(ib)).is_err()
+                || self.file.read_exact(&mut buf).is_err()
+            {
+                break;
+            }
+            ib += step;
+
+            let ptype = buf[t];
+            if ptype != buf[t + 1] || (ptype != PTYPE_NBT && ptype != PTYPE_BBT) {
+                continue;
+            }
+            // The checksum is what makes this safe: without it, any 512 bytes that
+            // happened to hold two equal bytes in the right place would be "a page".
+            if crc32(&buf[..t]) != u32le(&buf, t + 4) {
+                r.damaged_pages += 1;
+                continue;
+            }
+
+            let (count, size, level) = if self.page.wide_counts {
+                (u16le(&buf, f) as usize, buf[f + 4] as usize, buf[f + 5])
+            } else {
+                (buf[f] as usize, buf[f + 2] as usize, buf[f + 3])
+            };
+            if level != 0 || size == 0 || count * size > f {
+                continue;
+            }
+            let at = ib - step;
+
+            if ptype == PTYPE_NBT {
+                r.nbt_pages += 1;
+                for i in 0..count {
+                    let e = &buf[i * size..i * size + size];
+                    let n = Node {
+                        nid: u32le(e, 0),
+                        bid_data: u64le(e, 8),
+                        bid_sub: u64le(e, 16),
+                        nid_parent: u32le(e, 24),
+                    };
+                    nodes.entry(n.nid).or_default().push((at, n));
+                }
+            } else {
+                r.bbt_pages += 1;
+                for i in 0..count {
+                    let e = &buf[i * size..i * size + size];
+                    let b = Block {
+                        bid: u64le(e, 0),
+                        ib: u64le(e, 8),
+                        cb: u16le(e, 16),
+                        cref: u16le(e, 18),
+                    };
+                    blocks.entry(b.bid & !1).or_default().push((at, b));
+                }
+            }
+        }
+
+        // Settle the block conflicts by reading the bytes. A freed entry generally points
+        // at space that has since been reused, so it fails its own identity or checksum
+        // and the live one does not. Where nothing validates, the latest copy is taken -
+        // it is the best guess left, and better than nothing at all.
+        let mut chosen: Vec<(u64, Vec<(u64, Block)>)> = blocks.into_iter().collect();
+        for (_, v) in chosen.iter_mut() {
+            v.sort_by_key(|(off, _)| *off);
+        }
+        for (_, v) in &chosen {
+            r.superseded += v.len() - 1;
+        }
+        let mut live: HashMap<u64, Block> = HashMap::new();
+        for (bid, v) in chosen {
+            let pick = if v.len() == 1 {
+                v[0].1
+            } else {
+                let mut found = None;
+                for (_, b) in v.iter().rev() {
+                    if self.block_intact(b) {
+                        found = Some(*b);
+                        break;
+                    }
+                }
+                match found {
+                    Some(b) => b,
+                    None => {
+                        r.unresolved += 1;
+                        v.last().unwrap().1
+                    }
+                }
+            };
+            live.insert(bid, pick);
+        }
+
+        // Node entries carry no checksum of their own, so they are settled two ways. A
+        // node whose data block did not survive is no use whatever it says, so those lose
+        // first. Among the rest the highest block id wins: a PST hands out block ids from
+        // a counter that only ever goes up, so the largest is the most recently written.
+        // That is a stronger signal than file position, which only says where the
+        // allocator happened to find room.
+        for (nid, mut v) in nodes {
+            r.superseded += v.len() - 1;
+            v.sort_by_key(|(_, n)| (live.contains_key(&(n.bid_data & !1)), n.bid_data));
+            let pick = v.last().unwrap().1;
+            r.nodes.push(Node { nid, ..pick });
+        }
+
+        r.nodes.sort_by_key(|n| n.nid);
+        r.blocks = live.into_values().collect();
+        r.blocks.sort_by_key(|b| b.bid);
+        r
+    }
+
+    /// Rebuild the block index from the blocks themselves, using no index at all.
+    ///
+    /// The last resort, and the strongest one. Every block ends with a trailer holding its
+    /// own length, id and checksum, and blocks are padded to a fixed alignment — so the
+    /// trailer of any block sits a fixed distance back from an aligned boundary. Testing
+    /// every boundary finds every block whose bytes are still intact, whether or not
+    /// anything in the file still points at it.
+    ///
+    /// This is what recovers data after the index pages holding it are gone. It cannot be
+    /// fooled into inventing a block: a candidate is only accepted when the checksum in
+    /// the trailer matches the bytes in front of it.
+    pub fn carve(&mut self) -> Vec<Block> {
+        let back = self.page.block_trailer_back;
+        let align = self.page.block_align;
+        // Later copies win: a block written after another at the same id is the newer of
+        // the two, and the file grows forwards.
+        let mut found: HashMap<u64, Block> = HashMap::new();
+
+        let mut buf = Vec::new();
+        let mut trailer = [0u8; 24];
+        let trailer_len = (back as usize).min(trailer.len());
+
+        // Every candidate is a block *end*: an aligned boundary with a trailer just
+        // before it. The trailer's own length field then says where the block began.
+        let mut end = align;
+        while end <= self.actual_len {
+            let t = end - back;
+            let ok = self.file.seek(SeekFrom::Start(t)).is_ok()
+                && self.file.read_exact(&mut trailer[..trailer_len]).is_ok();
+            if !ok {
+                break;
+            }
+            let cb = u16le(&trailer, 0) as u64;
+            let bid = u64le(&trailer, 8);
+            let total = (cb + back).div_ceil(align) * align;
+
+            // A block of this length, ending here, must start at or after the file start,
+            // and must be padded to exactly this boundary - otherwise the trailer belongs
+            // to something else and these bytes only look like one.
+            if cb > 0 && bid > 0 && total <= end {
+                let begin = end - total;
+                buf.resize(cb as usize, 0);
+                if self.file.seek(SeekFrom::Start(begin)).is_ok()
+                    && self.file.read_exact(&mut buf).is_ok()
+                    && crc32(&buf) == u32le(&trailer, 4)
+                {
+                    found.insert(bid & !1, Block { bid, ib: begin, cb: cb as u16, cref: 0 });
+                }
+            }
+            end += align;
+        }
+
+        let mut out: Vec<Block> = found.into_values().collect();
+        out.sort_by_key(|b| b.bid);
+        out
+    }
+
+    /// Whether a block index entry actually describes a live block: the bytes at that
+    /// offset must identify as that block and match their own checksum.
+    ///
+    /// This is what settles a conflict between two swept entries for the same id. A freed
+    /// entry usually points at space that has since been reused, so it fails one or both.
+    pub fn block_intact(&mut self, b: &Block) -> bool {
+        let back = self.page.block_trailer_back;
+        let total = (b.cb as u64 + back).div_ceil(self.page.block_align) * self.page.block_align;
+        if b.ib == 0 || b.ib + total > self.actual_len {
+            return false;
+        }
+        let mut buf = vec![0u8; total as usize];
+        if self.file.seek(SeekFrom::Start(b.ib)).is_err() || self.file.read_exact(&mut buf).is_err()
+        {
+            return false;
+        }
+        let t = (total - back) as usize;
+        u64le(&buf, t + 8) & !1 == b.bid & !1
+            && crc32(&buf[..b.cb as usize]) == u32le(&buf, t + 4)
+    }
+
+    /// Use a recovered block index instead of the one reached from the header.
+    pub fn adopt(&mut self, blocks: &[Block]) {
+        self.bbt = Some(blocks.iter().map(|b| (b.bid & !1, *b)).collect());
+    }
+
     /// Every block in the file, in B-tree order.
     pub fn blocks(&mut self) -> Vec<Block> {
         let mut out = Vec::new();
@@ -609,6 +937,7 @@ impl Pst {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     // Real files, fetched by tests/fetch-fixtures.ps1. Skipped rather than failed when
     // absent so a fresh clone still builds and tests green.
@@ -713,6 +1042,95 @@ mod tests {
             "gave up entirely on a file with an intact header"
         );
         let _ = std::fs::remove_file(cut);
+    }
+
+    /// Write a copy of a fixture with the named B-tree root pages zeroed out.
+    fn tear(name: &str, kill_nbt: bool, kill_bbt: bool) -> Option<String> {
+        let src = format!("tests/data/{name}");
+        if !std::path::Path::new(&src).exists() {
+            return None;
+        }
+        let mut b = std::fs::read(&src).unwrap();
+        // The two BREFs in the header ROOT structure point at the B-tree root pages.
+        let nbt = u64le(&b, OFF_BREF_NBT + 8) as usize;
+        let bbt = u64le(&b, OFF_BREF_BBT + 8) as usize;
+        for (kill, at) in [(kill_nbt, nbt), (kill_bbt, bbt)] {
+            if kill {
+                b[at..at + 512].fill(0);
+            }
+        }
+        let out = std::env::temp_dir().join(format!("pstfree-torn-{kill_nbt}{kill_bbt}-{name}"));
+        std::fs::write(&out, &b).unwrap();
+        Some(out.to_str().unwrap().to_string())
+    }
+
+    /// Every checksum in an undamaged file must verify. This is what stands behind the
+    /// CRC being the right algorithm over the right bytes — hundreds of real pages and
+    /// blocks written by Outlook, not a test vector.
+    #[test]
+    fn every_checksum_in_an_intact_file_verifies() {
+        for name in ["dist-list.pst", "passworded.pst", "example-2013.ost"] {
+            let Some(mut pst) = open(name) else { return };
+            let blocks = pst.blocks();
+            let _ = pst.nodes();
+            for b in &blocks {
+                let _ = pst.block(b.bid);
+            }
+            assert!(blocks.len() > 100, "{name}: only {} blocks checked", blocks.len());
+            assert!(pst.warnings.is_empty(), "{name}: {:?}", pst.warnings);
+        }
+    }
+
+    /// Carving must find the live blocks without consulting any index at all.
+    #[test]
+    fn carving_finds_the_blocks_the_index_lists() {
+        let Some(mut pst) = open("dist-list.pst") else { return };
+        let listed: HashSet<u64> = pst.blocks().iter().map(|b| b.bid & !1).collect();
+        let carved: HashSet<u64> = pst.carve().iter().map(|b| b.bid & !1).collect();
+        let missing: Vec<_> = listed.difference(&carved).collect();
+        assert!(missing.is_empty(), "carving missed {} live blocks: {missing:?}", missing.len());
+    }
+
+    /// The whole point of the project, as a test. A file whose node B-tree root is gone
+    /// still gives up every node it had, and each one still points at the same data.
+    #[test]
+    fn recovers_everything_from_a_destroyed_node_index() {
+        let Some(mut good) = open("dist-list.pst") else { return };
+        let want: BTreeMap<u32, u64> =
+            good.nodes().iter().map(|n| (n.nid, n.bid_data)).collect();
+
+        let torn = tear("dist-list.pst", true, false).unwrap();
+        let mut pst = Pst::open(&torn).unwrap();
+        assert!(pst.nodes().is_empty(), "the node index survived being zeroed");
+
+        let got: BTreeMap<u32, u64> =
+            pst.scan().nodes.iter().map(|n| (n.nid, n.bid_data)).collect();
+        assert_eq!(got, want, "sweeping did not recover the original node table");
+    }
+
+    /// And with *both* indexes destroyed, carving the blocks out of the file rebuilds
+    /// enough to get back to the same answer.
+    #[test]
+    fn recovers_everything_from_both_indexes_destroyed() {
+        let Some(mut good) = open("dist-list.pst") else { return };
+        let want: BTreeMap<u32, u64> =
+            good.nodes().iter().map(|n| (n.nid, n.bid_data)).collect();
+        let live: BTreeMap<u64, u64> =
+            good.blocks().iter().map(|b| (b.bid & !1, b.ib)).collect();
+
+        let torn = tear("dist-list.pst", true, true).unwrap();
+        let mut pst = Pst::open(&torn).unwrap();
+        assert!(pst.nodes().is_empty() && pst.blocks().is_empty(), "an index survived");
+
+        let carved = pst.carve();
+        for b in &carved {
+            if let Some(&ib) = live.get(&(b.bid & !1)) {
+                assert_eq!(b.ib, ib, "carved block {} at the wrong offset", b.bid);
+            }
+        }
+        let got: BTreeMap<u32, u64> =
+            pst.scan().nodes.iter().map(|n| (n.nid, n.bid_data)).collect();
+        assert_eq!(got, want, "recovery did not reproduce the original node table");
     }
 
     #[test]

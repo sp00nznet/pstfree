@@ -8,7 +8,7 @@ use ltp::{
     PID_DISPLAY_NAME, PID_MESSAGE_SIZE, PID_SENDER_NAME, PID_SUBJECT, PID_SUBMIT_TIME,
     PID_UNREAD_COUNT,
 };
-use ndb::{nid_type_name, Crypt, Node, Pst};
+use ndb::{nid_type_name, Block, Crypt, Node, Pst};
 use std::collections::BTreeMap;
 
 const NID_TYPE_FOLDER: u8 = 0x02;
@@ -22,8 +22,12 @@ pstfree - read, export and repair Outlook PST/OST files
   pstfree <file.pst> --list     every message: date, folder, sender, subject
   pstfree <file.pst> --props <nid>   every property on one node, as stored
   pstfree <file.pst> --export <dir>  write every message out as a .eml file
+  pstfree <file.pst> --verify   check every checksum, and what a sweep would recover
   pstfree <file.pst> --nodes    every node in the file
   pstfree <file.pst> --blocks   every block in the file
+
+Add --salvage to any command to rebuild the index by sweeping the file for
+surviving B-tree pages, instead of following the one in the header.
 
 No Outlook needed, and no password is ever asked for - a PST password is a
 checksum, not a key, and it protects nothing.
@@ -47,10 +51,11 @@ fn main() {
         }
     };
 
-    let nodes = pst.nodes();
-    let blocks = pst.blocks();
+    let salvage = args.iter().any(|a| a == "--salvage");
+    let (nodes, blocks) = index(&mut pst, salvage);
 
     match args.get(1).map(String::as_str) {
+        Some("--verify") => return verify(&mut pst, &nodes, &blocks),
         Some("--tree") => tree(&mut pst, &nodes),
         Some("--list") => list(&mut pst, &nodes),
         Some("--props") => props(&mut pst, &nodes, args.get(2).map(String::as_str)),
@@ -85,6 +90,143 @@ fn main() {
             std::process::exit(2);
         }
         None => summary(&path, &pst, &nodes, &blocks),
+    }
+}
+
+/// The node and block indexes, following the header's B-tree roots.
+///
+/// Falls back to sweeping the file when that produces nothing, because a file whose roots
+/// are gone is exactly the file someone is trying to rescue. `--salvage` forces the sweep
+/// even when the roots look fine, which is what to reach for when they are intact but
+/// wrong.
+fn index(pst: &mut Pst, salvage: bool) -> (Vec<Node>, Vec<Block>) {
+    let (mut nodes, mut blocks) = if salvage {
+        (Vec::new(), Vec::new())
+    } else {
+        (pst.nodes(), pst.blocks())
+    };
+    if !nodes.is_empty() && !blocks.is_empty() {
+        return (nodes, blocks);
+    }
+
+    // Each tree is replaced only if it is the one that failed. The two die separately,
+    // and a swept index carries entries freed long ago whose blocks have since been
+    // reused - so preferring an intact tree is not tidiness, it is the difference
+    // between reporting real damage and reporting ghosts.
+    let r = pst.scan();
+    if blocks.is_empty() {
+        // Carving beats sweeping here. A swept index page can only describe blocks it
+        // knew about when it was written, and if the live page is the one that was lost,
+        // every surviving copy is out of date - which silently yields an older revision
+        // of a message. Carving reads the blocks themselves, so it finds what is actually
+        // there. The swept entries fill in anything carving missed.
+        let carved = pst.carve();
+        let mut merged: BTreeMap<u64, Block> =
+            carved.iter().map(|b| (b.bid & !1, *b)).collect();
+
+        // Swept entries fill in anything carving missed, but only where the bytes they
+        // describe still check out. An entry freed long ago points at space that has been
+        // reused since, and letting those into the index turns every one of them into a
+        // "damaged block" in the report - ghosts of things that were deleted on purpose.
+        let mut from_pages = 0;
+        for b in &r.blocks {
+            if !merged.contains_key(&(b.bid & !1)) && pst.block_intact(b) {
+                merged.insert(b.bid & !1, *b);
+                from_pages += 1;
+            }
+        }
+        eprintln!(
+            "Block index unreadable. Carved {} blocks out of the file itself, plus {from_pages} from surviving index pages.",
+            carved.len()
+        );
+        blocks = merged.into_values().collect();
+        blocks.sort_by_key(|b| b.bid);
+        pst.adopt(&blocks);
+    }
+    if nodes.is_empty() {
+        eprintln!(
+            "Node index unreadable. Swept {} nodes from {} surviving pages.",
+            r.nodes.len(),
+            r.nbt_pages
+        );
+        nodes = r.nodes;
+    }
+    (nodes, blocks)
+}
+
+/// Check everything that can be checked, and say what a sweep would find that the index
+/// does not. This is the "what is actually wrong with my file" command.
+fn verify(pst: &mut Pst, nodes: &[Node], blocks: &[Block]) {
+    println!("Reading every block to check it against its own checksum...");
+    let (mut ok, mut bad) = (0usize, 0usize);
+    let before = pst.problem_count();
+    for b in blocks {
+        match pst.block(b.bid) {
+            Ok(_) => ok += 1,
+            Err(_) => bad += 1,
+        }
+    }
+    // A block that read but warned is one whose checksum failed - damaged, not missing.
+    let rotten = pst.problem_count().saturating_sub(before);
+
+    let r = pst.scan();
+    println!();
+    println!("  {} nodes and {} blocks reachable from the header's index", nodes.len(), blocks.len());
+    println!("  {ok} blocks read, {bad} unreadable, {rotten} failed their checksum");
+    println!(
+        "  {} pages swept, {} of them index pages ({} node, {} block)",
+        r.pages_scanned,
+        r.nbt_pages + r.bbt_pages,
+        r.nbt_pages,
+        r.bbt_pages
+    );
+    // Both of these are normal in a healthy file. A PST frees pages by unlinking them and
+    // leaves the bytes where they are, so the sweep keeps finding old ones. Reported so
+    // the numbers are not mistaken for damage.
+    if r.damaged_pages > 0 {
+        println!(
+            "  {} index pages failed their checksum — usually freed pages partly overwritten",
+            r.damaged_pages
+        );
+    }
+    if r.superseded > 0 {
+        println!(
+            "  {} superseded entries ignored — older copies of things that later moved",
+            r.superseded
+        );
+    }
+    if r.unresolved > 0 {
+        println!(
+            "  {} of those could not be confirmed against the bytes on disk — least trustworthy",
+            r.unresolved
+        );
+    }
+    let carved = pst.carve().len();
+    println!("  {carved} blocks can be carved out of the file with no index at all");
+
+    // The number that matters: what a sweep gets back that the index has lost.
+    let known: std::collections::HashSet<u32> = nodes.iter().map(|n| n.nid).collect();
+    let extra: Vec<&Node> = r.nodes.iter().filter(|n| !known.contains(&n.nid)).collect();
+    println!();
+    if extra.is_empty() {
+        println!("  Sweeping finds nothing the index has lost. The two agree.");
+    } else {
+        let msgs = extra.iter().filter(|n| n.nid_type() == NID_TYPE_MESSAGE).count();
+        let folders = extra.iter().filter(|n| n.nid_type() == NID_TYPE_FOLDER).count();
+        println!(
+            "  Sweeping recovers {} node(s) the index cannot reach — {msgs} message(s), {folders} folder(s).",
+            extra.len()
+        );
+        println!("  Run any command with --salvage to use them.");
+    }
+
+    if pst.warnings.is_empty() {
+        println!("\n  No damage found.");
+    } else {
+        println!("\n  {} problem(s):", pst.problem_count());
+        for w in &pst.warnings {
+            println!("    - {w}");
+        }
     }
 }
 
