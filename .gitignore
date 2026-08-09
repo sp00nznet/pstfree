@@ -1,0 +1,6 @@
+target/
+*.pst
+*.ost
+*.eml
+*.msg
+*.mbox
