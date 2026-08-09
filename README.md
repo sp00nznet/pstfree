@@ -3,9 +3,9 @@
 Read, export and repair Outlook `.pst` and `.ost` files on Windows. No Outlook
 required, no licence, no per-mailbox fee, no fake progress bar. MIT licensed.
 
-**Status: early.** It opens PST and OST files, walks both B-trees and tells you what is
-in them and what is wrong with them. It does not read your mail yet. See
-[Progress](#progress).
+**Status: early.** It opens PST and OST files and prints the folder tree with real names
+and message counts — including from a password-protected PST, without ever asking for the
+password. It does not read individual messages yet. See [Progress](#progress).
 
 Sibling project to [vncfree](https://github.com/sp00nznet/vncfree), same attitude:
 find the Windows payware, read the published spec it is hiding behind, give it away.
@@ -25,10 +25,12 @@ Here is what they are selling:
   It describes the node database, the B-trees, the property layer and the encoding —
   everything a reader needs. OST is the same container.
 - **The "password" is not encryption.** A PST password is stored as a **CRC32 of the
-  password** in the message store. The block obfuscation (`NDB_CRYPT_PERMUTE` /
-  `NDB_CRYPT_CYCLIC`) uses a **fixed table with no key at all** — it is identical whether
-  the file has a password or not. Any reader can simply not ask. The products charging
-  $30–$50 to "recover" a PST password are charging you to skip an `if` statement.
+  password** in the message store. The block obfuscation uses a **fixed table with no key
+  at all** — identical whether the file has a password or not. MS-PST section 5 calls the
+  two ciphers "**keyless**" in as many words. Any reader can simply not ask. The products
+  charging $30–$50 to "recover" a PST password are charging you to skip an `if` statement.
+  pstfree reads a password-protected file below and never asks; there is no code in it
+  that could.
 - **Repair is the only genuinely hard part** — and it is the part the marketing is
   vaguest about.
 
@@ -113,13 +115,32 @@ That's the product. Everything else is table stakes that already exists for free
 
 ```
 cargo build --release
-target\release\pstfree.exe archive.pst
+target\release\pstfree.exe archive.pst --tree
 ```
 
-One executable, no dependencies, no runtime, no installer. It never asks for a password.
+One executable, no runtime, no installer, and it never asks for a password.
+
+**This is a password-protected PST.** No password was set, supplied or requested:
 
 ```
-tests\data\passworded.pst
+> pstfree.exe passworded.pst --tree
+(root)
+  Top of Personal Folders
+    Deleted Items
+    Inbox
+    Outbox
+    Sent Items
+    Calendar
+    Contacts  (2)
+    ...
+  Search Root
+  Freebusy Data  (1)
+```
+
+Without `--tree` it surveys the file instead:
+
+```
+> pstfree.exe passworded.pst
   PST, Unicode format (version 23, 512-byte pages)
   271360 bytes on disk, 271360 declared in the header
   block encoding: permute - a fixed substitution table, no key
@@ -129,14 +150,10 @@ tests\data\passworded.pst
          18  0x02  folder
           3  0x04  message
          13  0x08  associated message
-         19  0x0D  hierarchy table
          ...
 
   No structural damage found.
 ```
-
-That file is password-protected. Nothing above asked for the password, because there is
-nothing there to ask about.
 
 `--nodes` and `--blocks` dump the two B-trees entry by entry.
 
@@ -185,6 +202,10 @@ own undocumented local store. Reading a file is a different job from being a mai
 Honest list of what hasn't been checked yet. These get answered before any of them get
 promised.
 
+- **`NDB_CRYPT_CYCLIC` is implemented but has never decoded a real file.** No fixture uses
+  it. The specification calls it a symmetric cipher and the test checks that running it
+  twice returns the original bytes, which is the only evidence behind it. Permute is
+  verified against real files and can be trusted; cyclic cannot be, yet.
 - **NID types `0x14`–`0x19` are not in MS-PST**, which lists them as unallocated. The test
   OST is full of them — 40 of type `0x14` and 39 of `0x15` in a file with 40 folders, so
   roughly one of each per folder. Best guess is the sync engine's per-folder state, which
@@ -193,22 +214,36 @@ promised.
   can restrict a local cache in ways this repo hasn't tested. Needs a real sample.
 - **How far past `scanpst.exe` can a rebuild actually get?** Truncation is the easy damage
   case and it already works. A torn B-tree is the real test and is not written yet.
-- **The two crypt tables.** `NDB_CRYPT_PERMUTE` and `NDB_CRYPT_CYCLIC` need the fixed
-  tables from MS-PST 5.1. Not needed to survey a file — pages and B-trees are never
-  encoded — but nothing above the node layer can be read without them.
 - **Page and block CRCs** need the table from MS-PST 5.3. Structure and block identity are
   checked already, which catches a torn index; the CRC is what tells "wrong page" apart
   from "right page, rotten bytes", so the repair pass will want it.
 
-Resolved along the way:
+### Resolved along the way
 
-- **Rust, no dependencies.** Single static exe, no runtime, matching vncfree. Parsed from
-  the spec rather than wrapping libpff, which keeps the licence MIT.
+- **The crypt tables are transcribed from MS-PST 5.1 and checked, not trusted.** The
+  specification publishes one 768-byte table in three parts. On the way in: 768 values,
+  every one within 0–255, each third a permutation of 0–255, and the third the exact
+  inverse of the first. Those properties hold only if every byte is right, so a
+  transcription slip could not have survived. The test re-checks all of it.
+- **Outlook 2013+ OST files zlib-compress their data blocks, and MS-PST does not mention
+  it.** Their block trailer carries eight bytes the specification's does not: a constant,
+  and the inflated length. When that disagrees with the stored length, the block is
+  zlib — one block in the test file goes 412 bytes → 1178. Found by noticing `78 9c` where
+  a heap header should have been.
+- **The large-page format differs in three silent ways**, none of which produce an error
+  if you assume the 512-byte layout — just plausible rubbish. Trailers sit 24 bytes from
+  the end of a page *or block*, not 16; blocks pad to 512 bytes, not 64; B-tree entry
+  counts are 16-bit. All three established by reading real files.
+- **One dependency, for zlib.** `miniz_oxide`, pure Rust and no build script, so the
+  executable stays self-contained. Reading the format itself needs nothing.
+- **Rust, parsed from the spec** rather than wrapping libpff, which keeps the licence MIT.
 - **ANSI PST is refused, not half-parsed.** Different header layout, 2GB ceiling, Outlook
   97–2002 only. It says so plainly instead of producing wrong answers.
-- **OST 2013+ is a different page layout** and nothing said so up front. `wVer 36` uses
-  4096-byte pages with the trailer 24 bytes from the end, not 16, and 16-bit entry counts.
-  Established by reading a real file. Both variants are handled.
+- **The folder tree comes from the node B-tree's parent pointers, not the folders' own
+  hierarchy tables.** Every node records its parent, so the tree falls straight out of the
+  node list and table contexts are not needed yet. They become worth implementing for
+  message listings — and for a file damaged badly enough that the two disagree, at which
+  point having both is exactly the point.
 
 ## Progress
 
@@ -220,17 +255,19 @@ Updated as things land. Nothing is claimed here until it runs.
 | 1 | Header, node and block B-trees, node survey | ✅ done — PST and OST, both page layouts |
 | 4a | The password no-op | ✅ done — it was never asked for |
 | 5a | Damage report — truncation, bad pages, loops, wrong ids | ✅ done |
-| 2 | Blocks: the two crypt tables, then heap and property contexts | 🟡 next |
-| 3 | The folder tree with real names, then messages and attachments | ⬜ not started |
+| 2 | Blocks: both ciphers, zlib, heaps and property contexts | ✅ done |
+| 3a | The folder tree, with names and message counts | ✅ done |
+| 3b | Table contexts, then messages, bodies and attachments | 🟡 next |
 | 4b | Export — eml / msg / mbox | ⬜ not started |
 | 5b | Page and block CRCs, to separate wrong pages from rotten ones | ⬜ not started |
 | 6 | Rebuild torn B-trees | ⬜ not started |
 | 7 | Carve orphaned nodes | ⬜ not started |
 | 8 | GUI | ⬜ not started |
 
-Verified against a real PST, a real 2013 OST and a real password-protected PST — the
-public fixtures from freepst, fetched by `tests\fetch-fixtures.ps1`. Test files are not
-committed, because real PSTs contain real mail.
+14 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
+the public fixtures from freepst, fetched by `tests\fetch-fixtures.ps1`. Test files are
+not committed, because real PSTs contain real mail; the tests skip rather than fail when
+they are absent.
 
 ## Licence
 

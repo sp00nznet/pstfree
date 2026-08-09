@@ -7,7 +7,8 @@
 //! whether or not the file has a "password", so a full structural survey of a PST needs
 //! no key, no Outlook and no permission.
 
-use std::collections::HashSet;
+use crate::crypt;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
@@ -40,9 +41,14 @@ const MAX_BTREE_DEPTH: u32 = 32;
 /// here, and only in ways nothing else needs to know about.
 ///
 /// Established by reading real files, because the large-page variant is what Outlook 2013
-/// onwards writes for OST and it does not match the 512-byte layout by simple scaling:
-/// its trailer sits 24 bytes from the end rather than 16, and its entry counts are 16-bit
-/// because 4096 bytes hold more entries than a byte can count.
+/// onwards writes for OST and it does not match the 512-byte layout by simple scaling.
+/// Three differences, all of them silent — a reader that assumes the 512-byte layout gets
+/// plausible-looking rubbish rather than an error:
+///
+/// - Trailers sit **24** bytes from the end of a page or block, not 16.
+/// - Blocks are padded to **512** bytes, not 64.
+/// - B-tree entry counts are 16-bit, because 4096 bytes hold more entries than a byte
+///   can count.
 #[derive(Debug, Clone, Copy)]
 struct Layout {
     size: u64,
@@ -52,10 +58,28 @@ struct Layout {
     footer: usize,
     /// Whether cEnt/cEntMax are 16-bit.
     wide_counts: bool,
+    /// What a block's total length is rounded up to.
+    block_align: u64,
+    /// How far the BLOCKTRAILER starts from the end of that padded length.
+    block_trailer_back: u64,
 }
 
-const LAYOUT_512: Layout = Layout { size: 512, trailer: 496, footer: 488, wide_counts: false };
-const LAYOUT_4K: Layout = Layout { size: 4096, trailer: 4072, footer: 4056, wide_counts: true };
+const LAYOUT_512: Layout = Layout {
+    size: 512,
+    trailer: 496,
+    footer: 488,
+    wide_counts: false,
+    block_align: 64,
+    block_trailer_back: 16,
+};
+const LAYOUT_4K: Layout = Layout {
+    size: 4096,
+    trailer: 4072,
+    footer: 4056,
+    wide_counts: true,
+    block_align: 512,
+    block_trailer_back: 24,
+};
 
 /// How data blocks are obfuscated. None of these take a key — the tables are fixed and
 /// identical for every PST ever written, which is why a password cannot keep anyone out.
@@ -153,15 +177,17 @@ pub struct Pst {
     pub actual_len: u64,
     pub nbt_root: Bref,
     pub bbt_root: Bref,
+    /// bid -> where its bytes are. Built on first use; the block B-tree is walked once.
+    bbt: Option<HashMap<u64, Block>>,
     /// Everything survivable that looked wrong on the way through. This is the seed of
     /// the damage report — the thing the paid tools replace with a progress bar.
     pub warnings: Vec<String>,
 }
 
-fn u16le(b: &[u8], o: usize) -> u16 {
+pub(crate) fn u16le(b: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([b[o], b[o + 1]])
 }
-fn u32le(b: &[u8], o: usize) -> u32 {
+pub(crate) fn u32le(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
 }
 fn u64le(b: &[u8], o: usize) -> u64 {
@@ -254,6 +280,7 @@ impl Pst {
             actual_len,
             nbt_root: bref(&h, OFF_BREF_NBT),
             bbt_root: bref(&h, OFF_BREF_BBT),
+            bbt: None,
             warnings,
         })
     }
@@ -371,6 +398,112 @@ impl Pst {
             });
         });
         out
+    }
+
+    /// A block's bytes, decoded. The low bit of a BID is reserved, so it is masked off
+    /// everywhere a block is looked up.
+    ///
+    /// Only *data* blocks are obfuscated. Internal blocks — the ones holding lists of
+    /// other block ids — are stored in the clear, which is how a file with a "password"
+    /// can be navigated without one.
+    pub fn block(&mut self, bid: u64) -> Result<Vec<u8>, String> {
+        if self.bbt.is_none() {
+            let map = self.blocks().into_iter().map(|b| (b.bid & !1, b)).collect();
+            self.bbt = Some(map);
+        }
+        let b = *self
+            .bbt
+            .as_ref()
+            .unwrap()
+            .get(&(bid & !1))
+            .ok_or_else(|| format!("block {bid} is not in the block index"))?;
+
+        // A block is its data, then padding, then the trailer, the whole thing rounded up
+        // to the format's block alignment.
+        let back = self.page.block_trailer_back;
+        let total = (b.cb as u64 + back).div_ceil(self.page.block_align) * self.page.block_align;
+        if b.ib + total > self.actual_len {
+            return Err(format!(
+                "block {bid} runs to offset {} but the file ends at {}",
+                b.ib + total,
+                self.actual_len
+            ));
+        }
+        let mut buf = vec![0u8; total as usize];
+        self.file.seek(SeekFrom::Start(b.ib)).map_err(|e| e.to_string())?;
+        self.file.read_exact(&mut buf).map_err(|e| e.to_string())?;
+
+        // BLOCKTRAILER: cb, wSig, dwCRC, bid. The id catches a block index pointing
+        // somewhere plausible but wrong.
+        let t = (total - back) as usize;
+        if u64le(&buf, t + 8) & !1 != bid & !1 {
+            return Err(format!(
+                "block at offset {} identifies as {} but the index called it {bid}",
+                b.ib,
+                u64le(&buf, t + 8)
+            ));
+        }
+        // The large-page format's trailer carries eight more bytes than the spec's, and
+        // the last two are the inflated length. When it disagrees with the stored length
+        // the block is zlib-compressed - which is how a 16MB OST holds far more than
+        // 16MB of mail, and is not mentioned anywhere in MS-PST.
+        let inflated = if back == 24 { u16le(&buf, t + 18) as usize } else { b.cb as usize };
+        buf.truncate(b.cb as usize);
+
+        if bid & 2 == 0 {
+            match self.crypt {
+                Crypt::None => {}
+                Crypt::Permute => crypt::permute_decode(&mut buf),
+                Crypt::Cyclic => crypt::cyclic(&mut buf, bid),
+                Crypt::Unknown(m) => {
+                    return Err(format!("block {bid} uses unknown encoding method 0x{m:02X}"))
+                }
+            }
+        }
+
+        if inflated != b.cb as usize {
+            buf = miniz_oxide::inflate::decompress_to_vec_zlib(&buf)
+                .map_err(|e| format!("block {bid} is compressed and would not inflate: {e:?}"))?;
+            if buf.len() != inflated {
+                self.warnings.push(format!(
+                    "block {bid} inflated to {} bytes, its trailer said {inflated}",
+                    buf.len()
+                ));
+            }
+        }
+        Ok(buf)
+    }
+
+    /// A node's data as the list of blocks it is made of.
+    ///
+    /// Anything over 8176 bytes does not fit in one block, so the node points at an
+    /// XBLOCK — a list of block ids — or an XXBLOCK, a list of XBLOCKs. Kept as a list
+    /// rather than concatenated because heap ids address a specific block by number.
+    pub fn node_blocks(&mut self, bid: u64) -> Result<Vec<Vec<u8>>, String> {
+        if bid == 0 {
+            return Ok(Vec::new());
+        }
+        let first = self.block(bid)?;
+        // Internal blocks are the indirection ones. btype 0x01 is XBLOCK/XXBLOCK.
+        if bid & 2 == 0 || first.len() < 8 || first[0] != 0x01 {
+            return Ok(vec![first]);
+        }
+        let level = first[1];
+        let count = u16le(&first, 2) as usize;
+        if 8 + count * 8 > first.len() {
+            return Err(format!("XBLOCK {bid} claims {count} entries, which do not fit"));
+        }
+        let children: Vec<u64> = (0..count).map(|i| u64le(&first, 8 + i * 8)).collect();
+
+        let mut out = Vec::new();
+        for c in children {
+            match level {
+                // XXBLOCK: each entry is an XBLOCK, so recurse one level.
+                2 => out.extend(self.node_blocks(c)?),
+                _ => out.push(self.block(c)?),
+            }
+        }
+        Ok(out)
     }
 
     /// Every block in the file, in B-tree order.
