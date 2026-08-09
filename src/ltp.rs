@@ -16,8 +16,12 @@ use std::collections::BTreeMap;
 const HN_SIGNATURE: u8 = 0xEC;
 /// Client signature saying "this heap holds a property context".
 pub const CLIENT_SIG_PC: u8 = 0xBC;
+/// ...and a table context.
+pub const CLIENT_SIG_TC: u8 = 0x7C;
 /// First byte of a BTHHEADER.
 const BTH_SIGNATURE: u8 = 0xB5;
+/// First byte of a TCINFO.
+const TC_SIGNATURE: u8 = 0x7C;
 
 // The handful of properties needed to draw a folder tree.
 pub const PID_DISPLAY_NAME: u16 = 0x3001;
@@ -48,6 +52,15 @@ pub const PID_ATTACH_METHOD: u16 = 0x3705;
 pub const PID_ATTACH_MIME_TAG: u16 = 0x370E;
 /// NID of the root folder. Fixed by the specification, the same in every file.
 pub const NID_ROOT_FOLDER: u32 = 0x122;
+/// A folder's tables share its node id with the type bits swapped: the folders under it,
+/// and the messages in it.
+pub const NID_TYPE_HIERARCHY_TABLE: u32 = 0x0D;
+pub const NID_TYPE_CONTENTS_TABLE: u32 = 0x0E;
+/// The recipient table hangs off a message as a subnode.
+pub const NID_TYPE_RECIPIENT_TABLE: u32 = 0x12;
+pub const PID_RECIPIENT_TYPE: u16 = 0x0C15;
+pub const PID_EMAIL_ADDRESS: u16 = 0x3003;
+pub const PID_SMTP_ADDRESS: u16 = 0x39FE;
 /// NID type of an attachment, which only ever appears as a subnode of its message.
 pub const NID_TYPE_ATTACHMENT: u32 = 0x05;
 /// PidTagAttachMethod saying the bytes are right here in PidTagAttachDataBinary.
@@ -382,6 +395,20 @@ pub fn filetime(ft: u64) -> String {
     format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
 }
 
+/// A FILETIME in the form an mbox `From ` separator line uses.
+pub fn asctime(ft: u64) -> String {
+    const DAY: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MON: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (y, m, d, hh, mm, ss, dow) = civil(ft);
+    format!(
+        "{} {} {d:2} {hh:02}:{mm:02}:{ss:02} {y}",
+        DAY[dow],
+        MON[(m - 1) as usize]
+    )
+}
+
 /// A FILETIME as an RFC 5322 `Date:` header.
 ///
 /// Always +0000: a PST records the instant, not the timezone it was displayed in, so
@@ -409,6 +436,213 @@ pub fn clean_subject(s: &str) -> &str {
     })
 }
 
+/// One column of a table context.
+pub struct Column {
+    pub prop: u16,
+    pub ptype: u16,
+    /// Where the cell sits in a row, and how wide it is.
+    ib: usize,
+    cb: usize,
+    /// Which bit of the row's cell-existence bitmap says whether this cell is set.
+    bit: usize,
+}
+
+/// A table context: the rows of a hierarchy table, contents table or recipient table.
+pub struct Tc {
+    pub rows: Vec<Row>,
+}
+
+pub struct Row {
+    /// For a folder's tables this is the NID of the child folder or message; for a
+    /// recipient table it is the row number.
+    pub id: u32,
+    pub props: BTreeMap<u16, Value>,
+}
+
+impl Row {
+    pub fn str(&self, id: u16) -> Option<&str> {
+        match self.props.get(&id) {
+            Some(Value::Str(s)) => Some(s),
+            _ => None,
+        }
+    }
+    pub fn int(&self, id: u16) -> Option<i64> {
+        match self.props.get(&id) {
+            Some(Value::Int(i)) => Some(*i),
+            _ => None,
+        }
+    }
+}
+
+/// Read a table context: a grid of properties, one row per thing the table lists.
+///
+/// Unlike a property context, a table stores every fixed-size value inline in the row
+/// however wide it is — a timestamp is eight bytes sitting in the row itself, not a
+/// reference to the heap. Only genuinely variable things go elsewhere.
+pub fn read_tc(pst: &mut Pst, bid_data: u64, bid_sub: u64) -> Result<Tc, String> {
+    let heap = Heap::new(pst.node_blocks(bid_data)?)?;
+    if heap.client_sig != CLIENT_SIG_TC {
+        return Err(format!(
+            "heap holds client type 0x{:02X}, not a table context",
+            heap.client_sig
+        ));
+    }
+    let info = heap.item(heap.user_root)?;
+    if info.len() < 22 {
+        return Err(format!("table header is {} bytes, expected at least 22", info.len()));
+    }
+    if info[0] != TC_SIGNATURE {
+        return Err(format!(
+            "not a table context: type byte is 0x{:02X}, expected 0x{TC_SIGNATURE:02X}",
+            info[0]
+        ));
+    }
+    let ncols = info[1] as usize;
+    // Ending offsets within a row for the 4-byte, 2-byte and 1-byte cell groups, and
+    // then for the bitmap. The last is therefore the width of a whole row.
+    let ceb_start = u16le(info, 6) as usize;
+    let width = u16le(info, 8) as usize;
+    let hnid_rows = u32le(info, 14);
+    if info.len() < 22 + ncols * 8 {
+        return Err(format!("table declares {ncols} columns that do not fit its header"));
+    }
+    if width == 0 || ceb_start > width {
+        return Err(format!("table rows are {width} bytes with a bitmap at {ceb_start}"));
+    }
+
+    let mut columns = Vec::with_capacity(ncols);
+    for i in 0..ncols {
+        let d = &info[22 + i * 8..30 + i * 8];
+        let tag = u32le(d, 0);
+        columns.push(Column {
+            prop: (tag >> 16) as u16,
+            ptype: tag as u16,
+            ib: u16le(d, 4) as usize,
+            cb: d[6] as usize,
+            bit: d[7] as usize,
+        });
+    }
+
+    // The rows live in the heap for a small table, or out in a subnode for a big one.
+    let blocks = if hnid_rows == 0 {
+        Vec::new()
+    } else if hnid_rows & 0x1F == 0 {
+        vec![heap.item(hnid_rows)?.to_vec()]
+    } else {
+        match pst.subnodes(bid_sub)?.get(&hnid_rows).copied() {
+            Some(s) => pst.node_blocks(s.data)?,
+            None => return Err(format!("table rows are in subnode 0x{hnid_rows:08X}, which is not there")),
+        }
+    };
+
+    // A row never straddles two blocks: each block holds as many whole rows as fit and
+    // the remainder is padding. Concatenating the blocks first would shift every row
+    // after the first block by that padding and quietly produce garbage.
+    let mut subs = None;
+    let mut rows = Vec::new();
+    for b in &blocks {
+        for r in b.chunks_exact(width).take(b.len() / width) {
+            let mut props = BTreeMap::new();
+            for c in &columns {
+                if c.ib + c.cb > width || c.bit / 8 >= width - ceb_start {
+                    continue;
+                }
+                let ceb = &r[ceb_start..width];
+                if ceb[c.bit / 8] & (0x80 >> (c.bit % 8)) == 0 {
+                    continue; // the cell is not set on this row
+                }
+                let cell = &r[c.ib..c.ib + c.cb];
+                let v = if is_variable(c.ptype) {
+                    let hnid = u32le(cell, 0);
+                    let bytes = if hnid == 0 {
+                        Vec::new()
+                    } else if hnid & 0x1F == 0 {
+                        heap.item(hnid).unwrap_or(&[]).to_vec()
+                    } else {
+                        if subs.is_none() {
+                            subs = Some(pst.subnodes(bid_sub).unwrap_or_default());
+                        }
+                        match subs.as_ref().unwrap().get(&hnid).copied() {
+                            Some(s) => pst.node_blocks(s.data).unwrap_or_default().concat(),
+                            None => {
+                                props.insert(c.prop, Value::MissingSubnode(hnid));
+                                continue;
+                            }
+                        }
+                    };
+                    decode(c.ptype, bytes)
+                } else {
+                    decode_inline(c.ptype, cell)
+                };
+                props.insert(c.prop, v);
+            }
+            rows.push(Row { id: u32le(r, 0), props });
+        }
+    }
+    Ok(Tc { rows })
+}
+
+/// One addressee of a message.
+pub struct Recipient {
+    /// 1 for To, 2 for Cc, 3 for Bcc.
+    pub kind: i64,
+    pub name: String,
+    pub email: String,
+}
+
+/// The real addressees of a message, from its recipient table.
+///
+/// This is what the display-name properties cannot give: `PidTagDisplayTo` holds the
+/// names Outlook showed, whereas this holds the addresses mail was actually sent to.
+pub fn read_recipients(pst: &mut Pst, bid_sub: u64) -> Vec<Recipient> {
+    let Ok(subs) = pst.subnodes(bid_sub) else { return Vec::new() };
+    let Some((_, sub)) = subs
+        .iter()
+        .find(|(nid, _)| *nid & 0x1F == NID_TYPE_RECIPIENT_TABLE)
+        .map(|(n, s)| (*n, *s))
+    else {
+        return Vec::new();
+    };
+    let Ok(tc) = read_tc(pst, sub.data, sub.sub) else { return Vec::new() };
+
+    tc.rows
+        .iter()
+        .map(|r| Recipient {
+            kind: r.int(PID_RECIPIENT_TYPE).unwrap_or(1),
+            name: r.str(PID_DISPLAY_NAME).unwrap_or("").to_string(),
+            // The SMTP address is the one worth having; the other is often an X.500
+            // path that means nothing outside the Exchange organisation it came from.
+            email: r
+                .str(PID_SMTP_ADDRESS)
+                .or(r.str(PID_EMAIL_ADDRESS))
+                .unwrap_or("")
+                .to_string(),
+        })
+        .collect()
+}
+
+/// Whether a property type is stored somewhere else and referenced, rather than sitting
+/// in the row. Everything of a fixed size lives in the row, however wide.
+fn is_variable(ptype: u16) -> bool {
+    matches!(ptype, 0x000D | 0x001E | 0x001F | 0x0102) || ptype & 0x1000 != 0
+}
+
+fn decode_inline(ptype: u16, b: &[u8]) -> Value {
+    let n = |w: usize| -> Option<u64> {
+        (b.len() >= w).then(|| b[..w].iter().rev().fold(0u64, |a, &x| (a << 8) | x as u64))
+    };
+    match ptype {
+        0x0002 => Value::Int(n(2).unwrap_or(0) as u16 as i16 as i64),
+        0x0003 | 0x000A => Value::Int(n(4).unwrap_or(0) as u32 as i32 as i64),
+        0x000B => Value::Bool(n(1).unwrap_or(0) & 1 != 0),
+        0x0004 => Value::Float(f32::from_bits(n(4).unwrap_or(0) as u32) as f64),
+        0x0005 | 0x0007 => Value::Float(f64::from_bits(n(8).unwrap_or(0))),
+        0x0006 | 0x0014 => Value::Int(n(8).unwrap_or(0) as i64),
+        0x0040 => Value::Time(n(8).unwrap_or(0)),
+        _ => Value::Raw { ptype, bytes: b.to_vec() },
+    }
+}
+
 /// Outlook stores strings as UTF-16LE. A damaged file can leave an odd trailing byte or
 /// an unpaired surrogate, so this drops those rather than refusing the whole name.
 fn utf16le(b: &[u8]) -> String {
@@ -423,6 +657,7 @@ fn utf16le(b: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::ndb::Pst;
+    use std::collections::BTreeSet;
 
     /// Read every folder in a fixture, end to end: node B-tree, block index, block
     /// decode, heap, B-tree on heap, properties. Any failure anywhere surfaces here.
@@ -566,6 +801,77 @@ mod tests {
             return;
         }
         assert!(names.iter().any(|n| n == "Inbox"), "no Inbox in {names:?}");
+    }
+
+    /// A folder's own hierarchy table must name the same children as the node B-tree's
+    /// parent pointers. Two independent records of the same fact, which is exactly why
+    /// having both is worth the work — where they disagree, the file is damaged.
+    #[test]
+    fn hierarchy_tables_agree_with_the_parent_pointers() {
+        for file in ["dist-list.pst", "example-2013.ost"] {
+            let path = format!("tests/data/{file}");
+            if !std::path::Path::new(&path).exists() {
+                continue;
+            }
+            let mut pst = Pst::open(&path).unwrap();
+            let nodes = pst.nodes();
+            let by_nid: BTreeMap<u32, crate::ndb::Node> =
+                nodes.iter().map(|n| (n.nid, *n)).collect();
+
+            let mut checked = 0;
+            for f in nodes.iter().filter(|n| n.nid_type() == 0x02) {
+                let table_nid = (f.nid & !0x1F) | NID_TYPE_HIERARCHY_TABLE;
+                let Some(t) = by_nid.get(&table_nid) else { continue };
+                let tc = read_tc(&mut pst, t.bid_data, t.bid_sub)
+                    .unwrap_or_else(|e| panic!("{file} hierarchy table 0x{table_nid:X}: {e}"));
+
+                let from_table: BTreeSet<u32> = tc.rows.iter().map(|r| r.id).collect();
+                // Search folders are folders too as far as a hierarchy table is
+                // concerned, and the root folder is its own parent - so neither the type
+                // filter nor the self-reference can be left out of the comparison.
+                let from_pointers: BTreeSet<u32> = nodes
+                    .iter()
+                    .filter(|n| {
+                        matches!(n.nid_type(), 0x02 | 0x03)
+                            && n.nid_parent == f.nid
+                            && n.nid != f.nid
+                    })
+                    .map(|n| n.nid)
+                    .collect();
+                assert_eq!(
+                    from_table, from_pointers,
+                    "{file} folder 0x{:X}: table and parent pointers disagree",
+                    f.nid
+                );
+                checked += 1;
+            }
+            assert!(checked > 5, "{file}: only {checked} hierarchy tables found");
+        }
+    }
+
+    /// Contents tables name the messages in a folder, and carry a usable subject.
+    #[test]
+    fn contents_tables_list_the_messages() {
+        let path = "tests/data/example-2013.ost";
+        if !std::path::Path::new(path).exists() {
+            return;
+        }
+        let mut pst = Pst::open(path).unwrap();
+        let nodes = pst.nodes();
+        let by_nid: BTreeMap<u32, crate::ndb::Node> = nodes.iter().map(|n| (n.nid, *n)).collect();
+        let mut listed = BTreeSet::new();
+
+        for f in nodes.iter().filter(|n| n.nid_type() == 0x02) {
+            let table_nid = (f.nid & !0x1F) | NID_TYPE_CONTENTS_TABLE;
+            let Some(t) = by_nid.get(&table_nid) else { continue };
+            let tc = read_tc(&mut pst, t.bid_data, t.bid_sub).unwrap();
+            for r in &tc.rows {
+                listed.insert(r.id);
+            }
+        }
+        let real: BTreeSet<u32> =
+            nodes.iter().filter(|n| n.nid_type() == 0x04).map(|n| n.nid).collect();
+        assert_eq!(listed, real, "contents tables and the node list disagree");
     }
 
     #[test]

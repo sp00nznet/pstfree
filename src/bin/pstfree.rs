@@ -1,15 +1,11 @@
-mod crypt;
-mod export;
-mod ltp;
-mod ndb;
-
-use ltp::{
-    clean_subject, filetime, read_node_pc, NID_ROOT_FOLDER, PID_CONTENT_COUNT, PID_DELIVERY_TIME,
-    PID_DISPLAY_NAME, PID_MESSAGE_SIZE, PID_SENDER_NAME, PID_SUBJECT, PID_SUBMIT_TIME,
-    PID_UNREAD_COUNT,
+use pstfree::ltp::{
+    self, clean_subject, filetime, read_node_pc, read_tc, NID_ROOT_FOLDER, NID_TYPE_CONTENTS_TABLE,
+    NID_TYPE_HIERARCHY_TABLE, PID_CONTENT_COUNT, PID_DELIVERY_TIME, PID_DISPLAY_NAME,
+    PID_MESSAGE_SIZE, PID_SENDER_NAME, PID_SUBJECT, PID_SUBMIT_TIME, PID_UNREAD_COUNT,
 };
-use ndb::{nid_type_name, Block, Crypt, Node, Pst};
-use std::collections::BTreeMap;
+use pstfree::ndb::{nid_type_name, Block, Crypt, Node, Pst};
+use pstfree::export;
+use std::collections::{BTreeMap, BTreeSet};
 
 const NID_TYPE_FOLDER: u8 = 0x02;
 const NID_TYPE_MESSAGE: u8 = 0x04;
@@ -21,7 +17,7 @@ pstfree - read, export and repair Outlook PST/OST files
   pstfree <file.pst> --tree     the folder tree, with names and message counts
   pstfree <file.pst> --list     every message: date, folder, sender, subject
   pstfree <file.pst> --props <nid>   every property on one node, as stored
-  pstfree <file.pst> --export <dir>  write every message out as a .eml file
+  pstfree <file.pst> --export <dir> [--format eml|mbox|msg]   write the mail out
   pstfree <file.pst> --verify   check every checksum, and what a sweep would recover
   pstfree <file.pst> --nodes    every node in the file
   pstfree <file.pst> --blocks   every block in the file
@@ -59,7 +55,19 @@ fn main() {
         Some("--tree") => tree(&mut pst, &nodes),
         Some("--list") => list(&mut pst, &nodes),
         Some("--props") => props(&mut pst, &nodes, args.get(2).map(String::as_str)),
-        Some("--export") => run_export(&mut pst, &nodes, args.get(2).map(String::as_str)),
+        Some("--export") => {
+            let fmt = match args.iter().position(|a| a == "--format") {
+                Some(i) => match args.get(i + 1).and_then(|s| export::Format::parse(s)) {
+                    Some(f) => f,
+                    None => {
+                        eprintln!("--format takes eml, mbox or msg");
+                        std::process::exit(2);
+                    }
+                },
+                None => export::Format::Eml,
+            };
+            run_export(&mut pst, &nodes, args.get(2).map(String::as_str), fmt)
+        }
         Some("--nodes") => {
             println!(
                 "{:>10}  {:<26} {:>10}  {:>18} {:>18}",
@@ -204,6 +212,44 @@ fn verify(pst: &mut Pst, nodes: &[Node], blocks: &[Block]) {
     let carved = pst.carve().len();
     println!("  {carved} blocks can be carved out of the file with no index at all");
 
+    // A second, independent record of what is in each folder. The parent pointers say
+    // one thing and the folder's own tables say another, and in an undamaged file they
+    // agree exactly - so where they do not, something is wrong that nothing else catches.
+    let by_nid: BTreeMap<u32, Node> = nodes.iter().map(|n| (n.nid, *n)).collect();
+    let (mut compared, mut disagree) = (0usize, 0usize);
+    for f in nodes.iter().filter(|n| n.nid_type() == NID_TYPE_FOLDER) {
+        for (table_type, want) in [
+            (NID_TYPE_HIERARCHY_TABLE, [0x02u8, 0x03].as_slice()),
+            (NID_TYPE_CONTENTS_TABLE, [0x04].as_slice()),
+        ] {
+            let Some(t) = by_nid.get(&((f.nid & !0x1F) | table_type)) else {
+                continue;
+            };
+            let Ok(tc) = read_tc(pst, t.bid_data, t.bid_sub) else {
+                continue;
+            };
+            let listed: BTreeSet<u32> = tc.rows.iter().map(|r| r.id).collect();
+            let pointed: BTreeSet<u32> = nodes
+                .iter()
+                .filter(|n| want.contains(&n.nid_type()) && n.nid_parent == f.nid && n.nid != f.nid)
+                .map(|n| n.nid)
+                .collect();
+            compared += 1;
+            if listed != pointed {
+                disagree += 1;
+                let only_table = listed.difference(&pointed).count();
+                let only_ptr = pointed.difference(&listed).count();
+                println!(
+                    "  folder 0x{:X}: its own table and the node parents disagree — {only_table} listed only in the table, {only_ptr} only by parent",
+                    f.nid
+                );
+            }
+        }
+    }
+    println!(
+        "  {compared} folder tables cross-checked against the node parents, {disagree} disagreed"
+    );
+
     // The number that matters: what a sweep gets back that the index has lost.
     let known: std::collections::HashSet<u32> = nodes.iter().map(|n| n.nid).collect();
     let extra: Vec<&Node> = r.nodes.iter().filter(|n| !known.contains(&n.nid)).collect();
@@ -330,7 +376,7 @@ fn list(pst: &mut Pst, nodes: &[Node]) {
     }
 }
 
-fn run_export(pst: &mut Pst, nodes: &[Node], dir: Option<&str>) {
+fn run_export(pst: &mut Pst, nodes: &[Node], dir: Option<&str>, format: export::Format) {
     let Some(dir) = dir else {
         eprintln!("--export needs a directory to write into, e.g. --export .\\mail");
         std::process::exit(2);
@@ -344,7 +390,7 @@ fn run_export(pst: &mut Pst, nodes: &[Node], dir: Option<&str>) {
     }
 
     let (names, _, _) = folders(pst, nodes);
-    let st = export::export(pst, nodes, &names, root);
+    let st = export::export(pst, nodes, &names, root, format);
 
     println!("{} message(s) written to {dir}", st.messages);
     if st.attachments > 0 {
@@ -474,7 +520,7 @@ fn print_branch(
     }
 }
 
-fn summary(path: &str, pst: &Pst, nodes: &[ndb::Node], blocks: &[ndb::Block]) {
+fn summary(path: &str, pst: &Pst, nodes: &[Node], blocks: &[Block]) {
     // From the header, not the file name — a renamed file still tells the truth.
     let kind = if pst.is_ost { "OST" } else { "PST" };
     let pages = if pst.ver >= 36 {

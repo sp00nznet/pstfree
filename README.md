@@ -3,11 +3,13 @@
 Read, export and repair Outlook `.pst` and `.ost` files on Windows. No Outlook
 required, no licence, no per-mailbox fee, no fake progress bar. MIT licensed.
 
-**Status: it gets your mail out, and it does not need the file to be intact.** Folder tree,
-message list, every property on any node, and `--export` to `.eml` files any mail client
-will open — from PST and OST alike, including from a password-protected PST without ever
-asking for the password. **Delete both of a PST's B-tree roots and it still recovers every
-message, byte for byte.** See [Progress](#progress).
+**Status: a window, a command line, and it does not need the file to be intact.** Browse a
+mailbox, or export the lot to `.eml`, `.mbox` or Outlook's own `.msg` — from PST and OST
+alike, including from a password-protected PST without ever asking for the password.
+**Delete both of a PST's B-tree roots and it still recovers every message, byte for byte.**
+See [Progress](#progress).
+
+![pstfree](docs/screenshot.png)
 
 Sibling project to [vncfree](https://github.com/sp00nznet/vncfree), same attitude:
 find the Windows payware, read the published spec it is hiding behind, give it away.
@@ -117,10 +119,17 @@ That's the product. Everything else is table stakes that already exists for free
 
 ```
 cargo build --release
-target\release\pstfree.exe archive.pst --tree
+target\release\pstfree-gui.exe archive.pst    the window
+target\release\pstfree.exe archive.pst --tree the command line
 ```
 
-One executable, no runtime, no installer, and it never asks for a password.
+Two executables, no runtime, no installer, and neither ever asks for a password.
+
+The window is plain Win32 against the common controls that ship with Windows: folders on
+the left, messages top right, the selected message underneath, and **File → Export all**
+for the whole mailbox in any of the three formats. Drop a `.pst` on it or pass one on the
+command line and it opens on the fullest folder. Everything below is the command line,
+which is the same reader underneath.
 
 **This is a password-protected PST.** No password was set, supplied or requested:
 
@@ -194,6 +203,31 @@ node 0x200184, message, 69 properties, 2 fetched from the subnode tree
 
 One directory per folder, one `.eml` per message — RFC 5322 with MIME, which Thunderbird,
 Outlook, `mutt` and everything else will open. Attachments are included as MIME parts.
+
+`--format mbox` writes one file per folder instead, with messages concatenated the way
+mail archives keep them. Lines that begin `From ` are escaped, and so are ones that already
+begin `>From `, because otherwise unescaping later would eat a `>` the sender wrote.
+
+`--format msg` writes Outlook's own format, which keeps the MAPI properties a mail message
+has nowhere to put. That means writing a compound file — a filesystem inside a file, with
+sectors, a FAT and a directory of named streams. It is verified two ways: a reader written
+against the format rather than against the writer round-trips everything back out, and
+7-Zip, which has never heard of this project, lists the result correctly:
+
+```
+> 7z l "Test 2.msg"
+Extension = compound
+   Size   Name
+     12   __substg1.0_0037001F          <- subject
+   3032   __substg1.0_007D001F          <- the original internet headers
+   5816   __substg1.0_10130102          <- the HTML body
+    224   __properties_version1.0
+          __recip_version1.0_#00000000  <- a storage, with the recipient inside
+     60   __recip_version1.0_#00000000\__substg1.0_39FE001F
+```
+
+**Recipients come from the message's recipient table**, so `To:` and `Cc:` carry the
+addresses mail was actually sent to rather than the names Outlook happened to display.
 
 **Where the message carries its original internet headers, those are what gets written** —
 the real `From`, the real `Message-ID`, the full `Received` chain, exactly as it arrived.
@@ -298,8 +332,8 @@ index that pointed at it is caught rather than parsed.
 attachments, embedded messages, plain/HTML/compressed-RTF bodies, calendar and contacts.
 Password ignored, because there is nothing there to ignore.
 
-**Export** — `.eml` per message with attachments inline, mirroring the folder tree.
-`.mbox` and `.msg` to follow, and rebuilding a clean `.pst` from a damaged one.
+**Export** — `.eml` per message with attachments inline, `.mbox` per folder, or `.msg`
+with the MAPI properties kept. Rebuilding a clean `.pst` from a damaged one is still to come.
 
 **Repair** — the differentiator, and the only genuinely hard part. All four now work:
 
@@ -321,10 +355,14 @@ promised.
   fixtures has any, so the code that pulls them out of the subnode tree is written and the
   MIME assembly around it is unit-tested, but the extraction itself has never run against
   real data. Treat it as unproven until a file with attachments turns up.
-- **Recipients come from the display-name properties, not the recipient table.** So `To:`
-  and `Cc:` on a rebuilt header carry the names Outlook showed rather than the addresses.
-  Messages that kept their original internet headers — most received mail — are unaffected,
-  because those are written through verbatim. Fixing it properly means table contexts.
+- **The window shows plain text only.** A message with an HTML body and no plain-text one
+  says so rather than rendering it; export to read those. Rendering HTML means either
+  hosting a browser control or writing a layout engine, and neither belongs in a reader.
+- **`.msg` output has never been opened by Outlook**, because there is no Outlook on the
+  machine it was written on. The compound file underneath is verified by a reader written
+  against the format and independently by 7-Zip, and the property streams follow MS-OXMSG
+  — but "a valid compound file with the right streams in it" is not the same claim as
+  "Outlook opens it", and only the first has been tested.
 - **`PidTagBody` (`0x1000`) is absent from all three fixtures.** The HTML body
   (`PidTagHtml`, `0x1013`) is there and correct — it scales with the message, 114 bytes
   for a short one and 5816 for a long one. But the plain-text body turns up under
@@ -379,11 +417,15 @@ promised.
 - **Rust, parsed from the spec** rather than wrapping libpff, which keeps the licence MIT.
 - **ANSI PST is refused, not half-parsed.** Different header layout, 2GB ceiling, Outlook
   97–2002 only. It says so plainly instead of producing wrong answers.
-- **The folder tree comes from the node B-tree's parent pointers, not the folders' own
-  hierarchy tables.** Every node records its parent, so the tree falls straight out of the
-  node list and table contexts are not needed yet. They become worth implementing for
-  message listings — and for a file damaged badly enough that the two disagree, at which
-  point having both is exactly the point.
+- **The folder tree comes from the node B-tree's parent pointers; the folders' own tables
+  are the cross-check.** Both are read now, and `--verify` compares them — two independent
+  records of the same fact, which agree exactly in an undamaged file and are worth having
+  precisely for when they do not. In the test files, 36 tables agree with the pointers
+  entry for entry.
+- **`.msg` needed a compound file writer, which is 300 lines and no dependency.** Sectors,
+  a FAT, a directory tree ordered by the format's own comparison (name length first, then
+  uppercased name), and a mini-stream so a 40-byte property table does not cost a whole
+  512-byte sector.
 
 ## Progress
 
@@ -402,11 +444,11 @@ Updated as things land. Nothing is claimed here until it runs.
 | 5b | Every checksum — header, pages, blocks — and `--verify` | ✅ done |
 | 6 | Rebuild torn B-trees by sweeping for surviving leaf pages | ✅ done |
 | 7 | Carve blocks out of the file with no index at all | ✅ done |
-| 3c | Table contexts, for recipients and a second opinion on membership | ⬜ not started |
-| 4c | Export to `.mbox` and `.msg` | ⬜ not started |
-| 8 | GUI | ⬜ not started |
+| 3c | Table contexts — recipients, and a second opinion on membership | ✅ done |
+| 4c | Export to `.mbox` and `.msg` | ✅ done |
+| 8 | The window | ✅ done |
 
-31 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
+38 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
 the public fixtures from freepst, fetched by `tests\fetch-fixtures.ps1`. Test files are
 not committed, because real PSTs contain real mail; the tests skip rather than fail when
 they are absent.

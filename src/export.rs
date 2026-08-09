@@ -16,10 +16,37 @@ use crate::ltp::{
     PID_DISPLAY_TO, PID_INTERNET_CODEPAGE, PID_INTERNET_MSG_ID, PID_SENDER_EMAIL, PID_SENDER_NAME,
     PID_SUBJECT, PID_SUBMIT_TIME, PID_TRANSPORT_HEADERS,
 };
-use crate::ltp::{read_node_pc, Pc, NID_ROOT_FOLDER};
+use crate::cfbf::{self, Item};
+use crate::ltp::{
+    asctime, read_node_pc, read_recipients, Pc, Recipient, NID_ROOT_FOLDER, PID_EMAIL_ADDRESS,
+    PID_DISPLAY_NAME, PID_MESSAGE_SIZE, PID_RECIPIENT_TYPE, PID_SMTP_ADDRESS,
+};
 use crate::ndb::{Node, Pst};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// What to write the mail out as.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    /// RFC 5322 with MIME. Opens anywhere.
+    Eml,
+    /// One file per folder, messages concatenated. What mail archives are kept in.
+    Mbox,
+    /// Outlook's own compound-file format. Keeps the MAPI properties a mail message
+    /// cannot carry.
+    Msg,
+}
+
+impl Format {
+    pub fn parse(s: &str) -> Option<Format> {
+        match s {
+            "eml" => Some(Format::Eml),
+            "mbox" => Some(Format::Mbox),
+            "msg" => Some(Format::Msg),
+            _ => None,
+        }
+    }
+}
 
 pub struct Stats {
     pub messages: usize,
@@ -34,6 +61,7 @@ pub fn export(
     nodes: &[Node],
     folder_names: &BTreeMap<u32, String>,
     root: &Path,
+    format: Format,
 ) -> Stats {
     let mut st = Stats {
         messages: 0,
@@ -51,7 +79,7 @@ pub fn export(
             .cloned()
             .unwrap_or_else(|| root.join("_no-folder"));
 
-        match write_message(pst, n, &dir) {
+        match write_message(pst, n, &dir, format) {
             Ok(attached) => {
                 st.messages += 1;
                 st.attachments += attached;
@@ -137,30 +165,84 @@ fn safe_name(s: &str, unique: u32) -> String {
     out
 }
 
-fn write_message(pst: &mut Pst, node: &Node, dir: &Path) -> Result<usize, String> {
+fn write_message(
+    pst: &mut Pst,
+    node: &Node,
+    dir: &Path,
+    format: Format,
+) -> Result<usize, String> {
     let pc = read_node_pc(pst, node)?;
     let attachments = collect_attachments(pst, node);
-    let eml = build_eml(&pc, &attachments);
+    let recipients = read_recipients(pst, node.bid_sub);
+    let subject = clean_subject(pc.str(PID_SUBJECT).unwrap_or("(no subject)"));
+
+    if format == Format::Mbox {
+        // One file per folder rather than one per message, so the folder's own directory
+        // is not created at all - the mbox takes its place beside where it would have been.
+        let parent = dir.parent().unwrap_or(Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        let path = PathBuf::from(format!("{}.mbox", dir.display()));
+
+        let eml = build_eml(&pc, &attachments, &recipients);
+        let when = pc.time(PID_DELIVERY_TIME).or(pc.time(PID_SUBMIT_TIME)).unwrap_or(0);
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        std::io::Write::write_all(&mut f, &mbox_entry(&eml, when))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        return Ok(attachments.len());
+    }
 
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let subject = clean_subject(pc.str(PID_SUBJECT).unwrap_or("(no subject)"));
+    let (ext, bytes) = match format {
+        Format::Msg => ("msg", build_msg(&pc, &attachments, &recipients)),
+        _ => ("eml", build_eml(&pc, &attachments, &recipients)),
+    };
     let base = safe_name(subject, node.nid);
 
     // Two messages in one folder very often share a subject, and writing both to the same
     // name would silently destroy one of them. The node id is unique within the file, so
     // one fallback is always enough.
-    let mut path = dir.join(format!("{base}.eml"));
+    let mut path = dir.join(format!("{base}.{ext}"));
     if path.exists() {
-        path = dir.join(format!("{base} (0x{:X}).eml", node.nid));
+        path = dir.join(format!("{base} (0x{:X}).{ext}", node.nid));
     }
-    std::fs::write(&path, eml).map_err(|e| format!("{}: {e}", path.display()))?;
+    std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(attachments.len())
 }
 
-struct Attachment {
-    name: String,
-    mime: String,
-    data: Vec<u8>,
+/// One message as it appears inside an mbox file.
+///
+/// The separator is a line beginning `From `, which means any line of the message that
+/// also begins that way has to be escaped or it would look like the start of the next
+/// message. Escaping `>From ` and `>>From ` too is the mboxrd convention, and it is the
+/// one that can be undone exactly.
+fn mbox_entry(eml: &[u8], when: u64) -> Vec<u8> {
+    let mut out = format!("From pstfree@localhost {}\r\n", asctime(when)).into_bytes();
+    for line in eml.split(|&b| b == b'\n') {
+        let bare = line.strip_prefix(b">").map_or(line, |l| {
+            let mut l = l;
+            while let Some(r) = l.strip_prefix(b">") {
+                l = r;
+            }
+            l
+        });
+        if bare.starts_with(b"From ") {
+            out.push(b'>');
+        }
+        out.extend_from_slice(line);
+        out.push(b'\n');
+    }
+    out.extend_from_slice(b"\n");
+    out
+}
+
+pub struct Attachment {
+    pub name: String,
+    pub mime: String,
+    pub data: Vec<u8>,
 }
 
 /// Attachments hang off the message as subnodes.
@@ -208,7 +290,7 @@ fn collect_attachments(pst: &mut Pst, node: &Node) -> Vec<Attachment> {
     out
 }
 
-fn build_eml(pc: &Pc, attachments: &[Attachment]) -> Vec<u8> {
+pub fn build_eml(pc: &Pc, attachments: &[Attachment], recipients: &[Recipient]) -> Vec<u8> {
     let mut out = String::new();
 
     // The original headers are the most faithful thing in the file - real addresses, real
@@ -240,7 +322,7 @@ fn build_eml(pc: &Pc, attachments: &[Attachment]) -> Vec<u8> {
                 }
             }
         }
-        None => synthesize_headers(pc, &mut out),
+        None => synthesize_headers(pc, recipients, &mut out),
     }
 
     let text = pc
@@ -320,6 +402,132 @@ fn build_eml(pc: &Pc, attachments: &[Attachment]) -> Vec<u8> {
     out.into_bytes()
 }
 
+/// Properties for one object in a `.msg`: the fixed-size ones packed into a table, the
+/// variable ones written out as their own streams.
+#[derive(Default)]
+struct Props {
+    entries: Vec<u8>,
+    streams: Vec<Item>,
+}
+
+impl Props {
+    fn fixed(&mut self, prop: u16, ptype: u16, value: u64) {
+        self.entries.extend_from_slice(&(((prop as u32) << 16) | ptype as u32).to_le_bytes());
+        self.entries.extend_from_slice(&6u32.to_le_bytes()); // readable and writable
+        self.entries.extend_from_slice(&value.to_le_bytes());
+    }
+
+    /// A variable-length value: the table records its size, and the bytes go in a stream
+    /// named for the property.
+    fn variable(&mut self, prop: u16, ptype: u16, bytes: Vec<u8>, declared: usize) {
+        self.entries.extend_from_slice(&(((prop as u32) << 16) | ptype as u32).to_le_bytes());
+        self.entries.extend_from_slice(&6u32.to_le_bytes());
+        self.entries.extend_from_slice(&(declared as u32).to_le_bytes());
+        self.entries.extend_from_slice(&0u32.to_le_bytes());
+        self.streams.push(Item::Stream(format!("__substg1.0_{prop:04X}{ptype:04X}"), bytes));
+    }
+
+    fn string(&mut self, prop: u16, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        let utf16: Vec<u8> = s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+        // The recorded size counts the terminator that is not written to the stream.
+        let declared = utf16.len() + 2;
+        self.variable(prop, 0x001F, utf16, declared);
+    }
+
+    fn binary(&mut self, prop: u16, b: &[u8]) {
+        if b.is_empty() {
+            return;
+        }
+        self.variable(prop, 0x0102, b.to_vec(), b.len());
+    }
+
+    fn time(&mut self, prop: u16, ft: u64) {
+        if ft != 0 {
+            self.fixed(prop, 0x0040, ft);
+        }
+    }
+
+    /// The property table stream, with the header the object's kind requires in front.
+    fn finish(mut self, header: Vec<u8>) -> Vec<Item> {
+        let mut table = header;
+        table.extend_from_slice(&self.entries);
+        self.streams.push(Item::Stream("__properties_version1.0".into(), table));
+        self.streams
+    }
+}
+
+/// Build a `.msg`: Outlook's own format, which keeps the MAPI properties that a mail
+/// message has nowhere to put.
+///
+/// Strings are written as Unicode throughout, and `PidTagStoreSupportMask` says so — a
+/// reader uses that flag to decide how to interpret every string in the file, so getting
+/// it wrong turns the whole message into mojibake rather than failing outright.
+pub fn build_msg(pc: &Pc, attachments: &[Attachment], recipients: &[Recipient]) -> Vec<u8> {
+    let mut p = Props::default();
+    const STORE_UNICODE_OK: u64 = 0x0004_0000;
+    p.fixed(0x340D, 0x0003, STORE_UNICODE_OK);
+    p.string(0x001A, pc.str(0x001A).unwrap_or("IPM.Note"));
+    p.string(PID_SUBJECT, clean_subject(pc.str(PID_SUBJECT).unwrap_or("")));
+    p.string(PID_SENDER_NAME, pc.str(PID_SENDER_NAME).unwrap_or(""));
+    p.string(PID_SENDER_EMAIL, pc.str(PID_SENDER_EMAIL).unwrap_or(""));
+    p.string(PID_DISPLAY_TO, pc.str(PID_DISPLAY_TO).unwrap_or(""));
+    p.string(PID_DISPLAY_CC, pc.str(PID_DISPLAY_CC).unwrap_or(""));
+    p.string(PID_TRANSPORT_HEADERS, pc.str(PID_TRANSPORT_HEADERS).unwrap_or(""));
+    p.string(PID_INTERNET_MSG_ID, pc.str(PID_INTERNET_MSG_ID).unwrap_or(""));
+    p.string(PID_BODY, pc.str(PID_BODY).unwrap_or(""));
+    if let Some(Value::Bytes(h)) = pc.props.get(&PID_BODY_HTML) {
+        p.binary(PID_BODY_HTML, h);
+    }
+    p.time(PID_DELIVERY_TIME, pc.time(PID_DELIVERY_TIME).unwrap_or(0));
+    p.time(PID_SUBMIT_TIME, pc.time(PID_SUBMIT_TIME).unwrap_or(0));
+    if let Some(n) = pc.int(PID_MESSAGE_SIZE) {
+        p.fixed(PID_MESSAGE_SIZE, 0x0003, n as u32 as u64);
+    }
+
+    // A message's header records how many recipients and attachments follow, and what id
+    // the next one would take.
+    let mut header = vec![0u8; 8];
+    header.extend_from_slice(&(recipients.len() as u32).to_le_bytes());
+    header.extend_from_slice(&(attachments.len() as u32).to_le_bytes());
+    header.extend_from_slice(&(recipients.len() as u32).to_le_bytes());
+    header.extend_from_slice(&(attachments.len() as u32).to_le_bytes());
+    header.extend_from_slice(&[0u8; 8]);
+
+    let mut items = p.finish(header);
+
+    for (i, r) in recipients.iter().enumerate() {
+        let mut rp = Props::default();
+        rp.fixed(PID_RECIPIENT_TYPE, 0x0003, r.kind as u64);
+        rp.string(PID_DISPLAY_NAME, &r.name);
+        rp.string(PID_EMAIL_ADDRESS, &r.email);
+        rp.string(PID_SMTP_ADDRESS, &r.email);
+        rp.string(0x3002, "SMTP"); // PidTagAddressType
+        items.push(Item::Storage(
+            format!("__recip_version1.0_#{i:08X}"),
+            rp.finish(vec![0u8; 8]),
+        ));
+    }
+
+    for (i, a) in attachments.iter().enumerate() {
+        let mut ap = Props::default();
+        ap.fixed(PID_ATTACH_METHOD, 0x0003, ATTACH_BY_VALUE as u64);
+        ap.fixed(0x0E20, 0x0003, a.data.len() as u64); // PidTagAttachSize
+        ap.string(PID_ATTACH_LONG_FILENAME, &a.name);
+        ap.string(PID_ATTACH_FILENAME, &a.name);
+        ap.string(PID_ATTACH_MIME_TAG, &a.mime);
+        ap.binary(PID_ATTACH_DATA, &a.data);
+        items.push(Item::Storage(
+            format!("__attach_version1.0_#{i:08X}"),
+            ap.finish(vec![0u8; 8]),
+        ));
+    }
+
+    cfbf::build(items)
+}
+
 fn write_parts(parts: &[(String, Vec<u8>)], boundary: &str, out: &mut String) {
     for (ct, body) in parts {
         out.push_str(&format!("--{boundary}\r\n"));
@@ -332,7 +540,7 @@ fn write_parts(parts: &[(String, Vec<u8>)], boundary: &str, out: &mut String) {
     out.push_str(&format!("--{boundary}--\r\n"));
 }
 
-fn synthesize_headers(pc: &Pc, out: &mut String) {
+fn synthesize_headers(pc: &Pc, recipients: &[Recipient], out: &mut String) {
     let from = match (pc.str(PID_SENDER_NAME), pc.str(PID_SENDER_EMAIL)) {
         (Some(n), Some(e)) if e.contains('@') => format!("{} <{e}>", encode_header(n)),
         (Some(n), _) => encode_header(n),
@@ -342,9 +550,28 @@ fn synthesize_headers(pc: &Pc, out: &mut String) {
     if !from.is_empty() {
         out.push_str(&format!("From: {from}\r\n"));
     }
-    for (tag, id) in [("To", PID_DISPLAY_TO), ("Cc", PID_DISPLAY_CC)] {
-        if let Some(v) = pc.str(id).filter(|v| !v.trim().is_empty()) {
-            out.push_str(&format!("{tag}: {}\r\n", encode_header(v)));
+    // Real addressees from the recipient table where there is one. The display-name
+    // properties are the fallback: they hold what Outlook showed, not where it was sent.
+    for (kind, tag, fallback) in
+        [(1, "To", PID_DISPLAY_TO), (2, "Cc", PID_DISPLAY_CC), (3, "Bcc", 0)]
+    {
+        let listed: Vec<String> = recipients
+            .iter()
+            .filter(|r| r.kind == kind)
+            .map(|r| match (r.name.trim(), r.email.trim()) {
+                ("", e) => e.to_string(),
+                (n, "") => encode_header(n),
+                (n, e) => format!("{} <{e}>", encode_header(n)),
+            })
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if !listed.is_empty() {
+            out.push_str(&format!("{tag}: {}\r\n", listed.join(", ")));
+        } else if fallback != 0 {
+            if let Some(v) = pc.str(fallback).filter(|v| !v.trim().is_empty()) {
+                out.push_str(&format!("{tag}: {}\r\n", encode_header(v)));
+            }
         }
     }
     if let Some(t) = pc.time(PID_DELIVERY_TIME).or(pc.time(PID_SUBMIT_TIME)) {
@@ -525,7 +752,7 @@ mod tests {
             (PID_TRANSPORT_HEADERS, Value::Str(headers.into())),
             (PID_BODY, Value::Str("text".into())),
         ]);
-        let eml = String::from_utf8(build_eml(&pc, &[])).unwrap();
+        let eml = String::from_utf8(build_eml(&pc, &[], &[])).unwrap();
         let head = eml.split("\r\n\r\n").next().unwrap();
 
         assert!(!head.contains("OLDBOUNDARY"), "orphan boundary survived:\n{head}");
@@ -550,7 +777,7 @@ mod tests {
             (PID_BODY, Value::Str("plain".into())),
             (PID_BODY_HTML, Value::Bytes(b"<p>rich</p>".to_vec())),
         ]);
-        let plain = String::from_utf8(build_eml(&pc, &[])).unwrap();
+        let plain = String::from_utf8(build_eml(&pc, &[], &[])).unwrap();
         assert!(plain.contains("multipart/alternative"), "{plain}");
         assert!(plain.contains("text/plain") && plain.contains("text/html"));
 
@@ -559,12 +786,66 @@ mod tests {
             mime: "text/plain".into(),
             data: b"hello".to_vec(),
         }];
-        let mixed = String::from_utf8(build_eml(&pc, &att)).unwrap();
+        let mixed = String::from_utf8(build_eml(&pc, &att, &[])).unwrap();
         assert!(mixed.contains("multipart/mixed"), "{mixed}");
         assert!(mixed.contains("filename=\"a.txt\""));
         // aGVsbG8= is "hello". The attachment bytes must actually be in there.
         assert!(mixed.contains("aGVsbG8="), "attachment payload missing");
         assert!(mixed.trim_end().ends_with("--"), "multipart is not closed");
+    }
+
+    /// A line beginning `From ` inside a message would look like the start of the next
+    /// one, so it has to be escaped - and lines that already begin with `>From ` too, or
+    /// unescaping afterwards would strip a `>` the sender actually wrote.
+    #[test]
+    fn mbox_escapes_lines_that_look_like_separators() {
+        let body = b"Subject: x\n\nFrom here on\n>From a quote\n>>From deeper\nnot From here\n";
+        let out = String::from_utf8(mbox_entry(body, 0)).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+
+        assert!(lines[0].starts_with("From pstfree@localhost "), "no separator: {:?}", lines[0]);
+        assert!(lines.contains(&">From here on"), "unescaped separator-alike:\n{out}");
+        assert!(lines.contains(&">>From a quote"), "quoted form not escaped:\n{out}");
+        assert!(lines.contains(&">>>From deeper"), "double-quoted form not escaped:\n{out}");
+        assert!(lines.contains(&"not From here"), "escaped something mid-line:\n{out}");
+        // Exactly one separator, or a reader would see two messages.
+        assert_eq!(lines.iter().filter(|l| l.starts_with("From ")).count(), 1);
+    }
+
+    /// The compound-file layer has its own round-trip tests; this checks that a message
+    /// actually comes out as one, with the streams a reader looks for.
+    #[test]
+    fn msg_is_a_compound_file_with_the_expected_streams() {
+        let pc = pc_with(&[
+            (PID_SUBJECT, Value::Str("hello".into())),
+            (PID_SENDER_NAME, Value::Str("Someone".into())),
+        ]);
+        let recipients = [Recipient {
+            kind: 1,
+            name: "A Person".into(),
+            email: "a@b.c".into(),
+        }];
+        let msg = build_msg(&pc, &[], &recipients);
+
+        assert_eq!(&msg[0..8], &[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1], "not a compound file");
+        assert_eq!(msg.len() % 512, 0, "not a whole number of sectors");
+
+        // Directory entry names are UTF-16, so the names appear in the bytes that way.
+        let as_utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect() };
+        for name in [
+            "__properties_version1.0",
+            "__substg1.0_0037001F",
+            "__recip_version1.0_#00000000",
+        ] {
+            let needle = as_utf16(name);
+            assert!(
+                msg.windows(needle.len()).any(|w| w == needle),
+                "no {name} in the file"
+            );
+        }
+        // And the subject itself is in there as Unicode.
+        let subject = as_utf16("hello");
+        assert!(msg.windows(subject.len()).any(|w| w == subject), "subject missing");
     }
 
     #[test]
