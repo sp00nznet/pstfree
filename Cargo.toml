@@ -1,0 +1,16 @@
+[package]
+name = "pstfree"
+version = "0.0.1"
+edition = "2021"
+description = "Read, export and repair Outlook PST/OST files on Windows. No Outlook, no licence, no fake progress bar."
+repository = "https://github.com/sp00nznet/pstfree"
+license = "MIT"
+readme = "README.md"
+keywords = ["pst", "ost", "outlook", "mapi", "forensics"]
+categories = ["parser-implementations", "command-line-utilities"]
+
+# No dependencies. The format is a published spec and this is bytes off a disk.
+[dependencies]
+
+[profile.release]
+strip = true
