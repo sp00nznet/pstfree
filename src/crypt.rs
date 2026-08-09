@@ -1,4 +1,4 @@
-﻿//! The two ciphers that obfuscate data blocks.
+//! The two ciphers that obfuscate data blocks.
 //!
 //! Microsoft's own description, in MS-PST section 5: the NDB layer encodes the data
 //! field of data blocks "to obfuscate the data using one of two **keyless** ciphers".
@@ -110,7 +110,10 @@ mod tests {
         for (name, t) in [("R", R), ("S", S), ("I", I)] {
             let mut seen = [false; 256];
             for &b in &MPBB[t..t + 256] {
-                assert!(!seen[b as usize], "{name} repeats {b}, so it is not a permutation");
+                assert!(
+                    !seen[b as usize],
+                    "{name} repeats {b}, so it is not a permutation"
+                );
                 seen[b as usize] = true;
             }
         }

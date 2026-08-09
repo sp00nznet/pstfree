@@ -31,6 +31,28 @@ pub const PID_DELIVERY_TIME: u16 = 0x0E06;
 pub const PID_SUBMIT_TIME: u16 = 0x0039;
 pub const PID_MESSAGE_SIZE: u16 = 0x0E08;
 
+// ...and for writing one back out as a mail message.
+/// The original internet headers, exactly as the message arrived.
+pub const PID_TRANSPORT_HEADERS: u16 = 0x007D;
+pub const PID_SENDER_EMAIL: u16 = 0x0C1F;
+pub const PID_DISPLAY_TO: u16 = 0x0E04;
+pub const PID_DISPLAY_CC: u16 = 0x0E03;
+pub const PID_BODY: u16 = 0x1000;
+pub const PID_BODY_HTML: u16 = 0x1013;
+pub const PID_INTERNET_CODEPAGE: u16 = 0x3FDE;
+pub const PID_INTERNET_MSG_ID: u16 = 0x1035;
+pub const PID_ATTACH_DATA: u16 = 0x3701;
+pub const PID_ATTACH_FILENAME: u16 = 0x3704;
+pub const PID_ATTACH_LONG_FILENAME: u16 = 0x3707;
+pub const PID_ATTACH_METHOD: u16 = 0x3705;
+pub const PID_ATTACH_MIME_TAG: u16 = 0x370E;
+/// NID of the root folder. Fixed by the specification, the same in every file.
+pub const NID_ROOT_FOLDER: u32 = 0x122;
+/// NID type of an attachment, which only ever appears as a subnode of its message.
+pub const NID_TYPE_ATTACHMENT: u32 = 0x05;
+/// PidTagAttachMethod saying the bytes are right here in PidTagAttachDataBinary.
+pub const ATTACH_BY_VALUE: i64 = 1;
+
 /// A heap spread over a node's blocks.
 pub struct Heap {
     blocks: Vec<Vec<u8>>,
@@ -44,7 +66,10 @@ impl Heap {
     pub fn new(blocks: Vec<Vec<u8>>) -> Result<Heap, String> {
         let b0 = blocks.first().ok_or("node has no data blocks")?;
         if b0.len() < 12 {
-            return Err(format!("first block is {} bytes, too short for a heap header", b0.len()));
+            return Err(format!(
+                "first block is {} bytes, too short for a heap header",
+                b0.len()
+            ));
         }
         if b0[2] != HN_SIGNATURE {
             return Err(format!(
@@ -52,7 +77,11 @@ impl Heap {
                 b0[2]
             ));
         }
-        Ok(Heap { client_sig: b0[3], user_root: u32le(b0, 4), blocks })
+        Ok(Heap {
+            client_sig: b0[3],
+            user_root: u32le(b0, 4),
+            blocks,
+        })
     }
 
     /// The bytes of one heap allocation.
@@ -71,12 +100,16 @@ impl Heap {
         let index = ((hid >> 5) & 0x7FF) as usize;
         let block = (hid >> 16) as usize;
         if index == 0 {
-            return Err(format!("heap id 0x{hid:08X} has allocation index 0, which cannot exist"));
+            return Err(format!(
+                "heap id 0x{hid:08X} has allocation index 0, which cannot exist"
+            ));
         }
-        let b = self
-            .blocks
-            .get(block)
-            .ok_or_else(|| format!("heap id 0x{hid:08X} wants block {block}, node has {}", self.blocks.len()))?;
+        let b = self.blocks.get(block).ok_or_else(|| {
+            format!(
+                "heap id 0x{hid:08X} wants block {block}, node has {}",
+                self.blocks.len()
+            )
+        })?;
 
         // HNPAGEMAP: cAlloc, cFree, then cAlloc+1 offsets. Item n runs from offset n-1
         // to offset n.
@@ -101,7 +134,10 @@ impl Heap {
 
 fn u16le_at(b: &[u8], o: usize) -> Result<u16, String> {
     if o + 2 > b.len() {
-        return Err(format!("offset {o} is past the end of a {}-byte block", b.len()));
+        return Err(format!(
+            "offset {o} is past the end of a {}-byte block",
+            b.len()
+        ));
     }
     Ok(u16le(b, o))
 }
@@ -166,7 +202,10 @@ pub enum Value {
     /// case: the property survived and its contents did not.
     MissingSubnode(u32),
     /// A type this layer does not decode yet, kept so nothing is silently lost.
-    Raw { ptype: u16, bytes: Vec<u8> },
+    Raw {
+        ptype: u16,
+        bytes: Vec<u8>,
+    },
 }
 
 /// A property context: every property on a folder, message or attachment.
@@ -184,12 +223,20 @@ fn is_inline(ptype: u16) -> bool {
     matches!(ptype, 0x0000..=0x0004 | 0x000A | 0x000B)
 }
 
-/// Read every property on a node.
+/// Read every property on a node in the node B-tree.
+pub fn read_node_pc(pst: &mut Pst, node: &Node) -> Result<Pc, String> {
+    read_pc(pst, node.bid_data, node.bid_sub)
+}
+
+/// Read every property on anything that has a data block and a subnode tree.
+///
+/// Addressed by block id rather than by node, because attachments are subnodes and never
+/// appear in the node B-tree at all.
 ///
 /// Needs the file, not just the heap, because a value too big to fit the heap is stored
-/// out in the node's subnode tree and has to be fetched from there.
-pub fn read_pc(pst: &mut Pst, node: &Node) -> Result<Pc, String> {
-    let heap = Heap::new(pst.node_blocks(node.bid_data)?)?;
+/// out in the subnode tree and has to be fetched from there.
+pub fn read_pc(pst: &mut Pst, bid_data: u64, bid_sub: u64) -> Result<Pc, String> {
+    let heap = Heap::new(pst.node_blocks(bid_data)?)?;
     if heap.client_sig != CLIENT_SIG_PC {
         return Err(format!(
             "heap holds client type 0x{:02X}, not a property context",
@@ -232,12 +279,12 @@ pub fn read_pc(pst: &mut Pst, node: &Node) -> Result<Pc, String> {
             heap.item(raw)?.to_vec()
         } else {
             if subs.is_none() {
-                subs = Some(pst.subnodes(node.bid_sub)?);
+                subs = Some(pst.subnodes(bid_sub)?);
             }
-            match subs.as_ref().unwrap().get(&raw) {
-                Some(&data) => {
+            match subs.as_ref().unwrap().get(&raw).copied() {
+                Some(s) => {
                     from_subnode += 1;
-                    pst.node_blocks(data)?.concat()
+                    pst.node_blocks(s.data)?.concat()
                 }
                 None => {
                     props.insert(id, Value::MissingSubnode(raw));
@@ -248,7 +295,10 @@ pub fn read_pc(pst: &mut Pst, node: &Node) -> Result<Pc, String> {
 
         props.insert(id, decode(ptype, bytes));
     }
-    Ok(Pc { props, from_subnode })
+    Ok(Pc {
+        props,
+        from_subnode,
+    })
 }
 
 fn decode(ptype: u16, b: Vec<u8>) -> Value {
@@ -260,13 +310,15 @@ fn decode(ptype: u16, b: Vec<u8>) -> Value {
         // PtypString8 is in the file's own code page, which is not recorded anywhere in
         // the file. Treated as Latin-1: right for western text, and never a panic.
         0x001E => Value::Str(b.iter().map(|&c| c as char).collect()),
-        0x0040 => eight(&b).map(Value::Time).unwrap_or(Value::Raw { ptype, bytes: b }),
-        0x0014 | 0x0006 => {
-            eight(&b).map(|v| Value::Int(v as i64)).unwrap_or(Value::Raw { ptype, bytes: b })
-        }
-        0x0005 | 0x0007 => {
-            eight(&b).map(|v| Value::Float(f64::from_bits(v))).unwrap_or(Value::Raw { ptype, bytes: b })
-        }
+        0x0040 => eight(&b)
+            .map(Value::Time)
+            .unwrap_or(Value::Raw { ptype, bytes: b }),
+        0x0014 | 0x0006 => eight(&b)
+            .map(|v| Value::Int(v as i64))
+            .unwrap_or(Value::Raw { ptype, bytes: b }),
+        0x0005 | 0x0007 => eight(&b)
+            .map(|v| Value::Float(f64::from_bits(v)))
+            .unwrap_or(Value::Raw { ptype, bytes: b }),
         0x0102 | 0x0048 => Value::Bytes(b),
         _ => Value::Raw { ptype, bytes: b },
     }
@@ -296,14 +348,11 @@ impl Pc {
     }
 }
 
-/// A Windows FILETIME as `YYYY-MM-DD HH:MM`.
+/// Year, month, day, hour, minute, second, and day of the week, from a Windows FILETIME.
 ///
 /// Done by hand rather than with a date crate: it is one well-known algorithm and the
-/// alternative is a dependency for formatting a number.
-pub fn filetime(ft: u64) -> String {
-    if ft == 0 {
-        return "                ".into();
-    }
+/// alternative is a dependency for arithmetic on a number.
+fn civil(ft: u64) -> (i64, i64, i64, i64, i64, i64, usize) {
     // FILETIME counts 100ns ticks from 1601; Unix counts seconds from 1970.
     let unix = ft as i64 / 10_000_000 - 11_644_473_600;
     let (days, secs) = (unix.div_euclid(86400), unix.rem_euclid(86400));
@@ -319,7 +368,35 @@ pub fn filetime(ft: u64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
 
-    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", secs / 3600, secs / 60 % 60)
+    // 1970-01-01 was a Thursday, which is index 4 counting from Sunday.
+    let dow = (days + 4).rem_euclid(7) as usize;
+    (y, m, d, secs / 3600, secs / 60 % 60, secs % 60, dow)
+}
+
+/// A Windows FILETIME as `YYYY-MM-DD HH:MM`, for the listings.
+pub fn filetime(ft: u64) -> String {
+    if ft == 0 {
+        return "                ".into();
+    }
+    let (y, m, d, hh, mm, ..) = civil(ft);
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
+}
+
+/// A FILETIME as an RFC 5322 `Date:` header.
+///
+/// Always +0000: a PST records the instant, not the timezone it was displayed in, so
+/// claiming any offset would be inventing information.
+pub fn rfc5322_date(ft: u64) -> String {
+    const DAY: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MON: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (y, m, d, hh, mm, ss, dow) = civil(ft);
+    format!(
+        "{}, {d} {} {y} {hh:02}:{mm:02}:{ss:02} +0000",
+        DAY[dow],
+        MON[(m - 1) as usize]
+    )
 }
 
 /// Outlook prefixes a subject with U+0001 and a length byte when it has a "RE:"-style
@@ -335,7 +412,10 @@ pub fn clean_subject(s: &str) -> &str {
 /// Outlook stores strings as UTF-16LE. A damaged file can leave an odd trailing byte or
 /// an unpaired surrogate, so this drops those rather than refusing the whole name.
 fn utf16le(b: &[u8]) -> String {
-    let units: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let units: Vec<u16> = b
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
     String::from_utf16_lossy(&units)
 }
 
@@ -356,7 +436,7 @@ mod tests {
         let nodes = pst.nodes();
         let mut names = Vec::new();
         for n in nodes.iter().filter(|n| n.nid_type() == 0x02) {
-            let pc = read_pc(&mut pst, n)
+            let pc = read_node_pc(&mut pst, n)
                 .unwrap_or_else(|e| panic!("{file} folder 0x{:X}: {e}", n.nid));
             if let Some(s) = pc.str(PID_DISPLAY_NAME) {
                 names.push(s.to_string());
@@ -378,13 +458,15 @@ mod tests {
         let nodes = pst.nodes();
         let mut fetched = 0;
         for n in nodes.iter().filter(|n| n.nid_type() == 0x04) {
-            let pc = read_pc(&mut pst, n).unwrap();
+            let pc = read_node_pc(&mut pst, n).unwrap();
             fetched += pc.from_subnode;
             // A value that says it lives in a subnode, in a node whose subnode tree does
             // not list it, means the walk is wrong or the file is damaged. Neither is
             // true of these fixtures, so it must not happen.
             assert!(
-                !pc.props.values().any(|v| matches!(v, Value::MissingSubnode(_))),
+                !pc.props
+                    .values()
+                    .any(|v| matches!(v, Value::MissingSubnode(_))),
                 "message 0x{:X} points at a subnode that is not in its subnode tree",
                 n.nid
             );
@@ -404,7 +486,7 @@ mod tests {
             let nodes = pst.nodes();
             let (mut seen, mut timed) = (0, 0);
             for n in nodes.iter().filter(|n| n.nid_type() == 0x04) {
-                let pc = read_pc(&mut pst, n)
+                let pc = read_node_pc(&mut pst, n)
                     .unwrap_or_else(|e| panic!("{file} message 0x{:X}: {e}", n.nid));
                 assert!(
                     pc.props.contains_key(&PID_SUBJECT),
@@ -413,13 +495,20 @@ mod tests {
                 );
                 // Not every message node is mail. Outlook keeps internal objects like
                 // LocalFreebusy in here too, and those have no delivery or submit time.
-                if pc.time(PID_DELIVERY_TIME).or(pc.time(PID_SUBMIT_TIME)).is_some() {
+                if pc
+                    .time(PID_DELIVERY_TIME)
+                    .or(pc.time(PID_SUBMIT_TIME))
+                    .is_some()
+                {
                     timed += 1;
                 }
                 seen += 1;
             }
             assert!(seen > 0, "{file}: no messages found");
-            assert!(timed > 0, "{file}: not one of {seen} messages had a readable timestamp");
+            assert!(
+                timed > 0,
+                "{file}: not one of {seen} messages had a readable timestamp"
+            );
         }
     }
 
@@ -448,7 +537,10 @@ mod tests {
             return;
         }
         for expected in ["Inbox", "Deleted Items", "Sent Items", "Calendar"] {
-            assert!(names.iter().any(|n| n == expected), "no {expected:?} in {names:?}");
+            assert!(
+                names.iter().any(|n| n == expected),
+                "no {expected:?} in {names:?}"
+            );
         }
     }
 
@@ -460,7 +552,10 @@ mod tests {
             return;
         }
         for expected in ["Inbox", "Outbox", "Organization Forms"] {
-            assert!(names.iter().any(|n| n == expected), "no {expected:?} in {names:?}");
+            assert!(
+                names.iter().any(|n| n == expected),
+                "no {expected:?} in {names:?}"
+            );
         }
     }
 
@@ -475,7 +570,9 @@ mod tests {
 
     #[test]
     fn rejects_a_heap_that_is_not_one() {
-        let e = Heap::new(vec![vec![0u8; 32]]).err().expect("zeroes are not a heap");
+        let e = Heap::new(vec![vec![0u8; 32]])
+            .err()
+            .expect("zeroes are not a heap");
         assert!(e.contains("not a heap"), "unhelpful error: {e}");
     }
 
@@ -494,4 +591,3 @@ mod tests {
         assert_eq!(utf16le(&[0x41, 0x00, 0x42]), "A");
     }
 }
-

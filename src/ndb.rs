@@ -118,6 +118,15 @@ pub struct Node {
     pub nid_parent: u32,
 }
 
+/// One entry in a node's subnode tree.
+#[derive(Debug, Clone, Copy)]
+pub struct Sub {
+    pub data: u64,
+    /// A subnode has a subnode tree of its own. Attachments are where this matters: the
+    /// attachment is a subnode of the message, and its bytes hang off the attachment.
+    pub sub: u64,
+}
+
 /// One entry in the block B-tree: where a block's bytes are and how many there are.
 #[derive(Debug, Clone, Copy)]
 pub struct Block {
@@ -196,7 +205,10 @@ fn u64le(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(a)
 }
 fn bref(b: &[u8], o: usize) -> Bref {
-    Bref { bid: u64le(b, o), ib: u64le(b, o + 8) }
+    Bref {
+        bid: u64le(b, o),
+        ib: u64le(b, o + 8),
+    }
 }
 
 impl Pst {
@@ -265,9 +277,8 @@ impl Pst {
             ));
         }
         if h[OFF_FAMAP_VALID] == 0 {
-            warnings.push(
-                "allocation map is marked invalid — the file was not closed cleanly".into(),
-            );
+            warnings
+                .push("allocation map is marked invalid — the file was not closed cleanly".into());
         }
 
         Ok(Pst {
@@ -293,7 +304,9 @@ impl Pst {
             ));
         }
         let mut buf = vec![0u8; self.page.size as usize];
-        self.file.seek(SeekFrom::Start(at.ib)).map_err(|e| e.to_string())?;
+        self.file
+            .seek(SeekFrom::Start(at.ib))
+            .map_err(|e| e.to_string())?;
         self.file.read_exact(&mut buf).map_err(|e| e.to_string())?;
 
         // PAGETRAILER: ptype, ptypeRepeat, wSig, dwCRC, bid.
@@ -301,7 +314,9 @@ impl Pst {
         if buf[t] != buf[t + 1] {
             return Err(format!(
                 "page at {} has mismatched type bytes (0x{:02X}/0x{:02X}) — not a page",
-                at.ib, buf[t], buf[t + 1]
+                at.ib,
+                buf[t],
+                buf[t + 1]
             ));
         }
         // Low bit of a BID is reserved and is not part of the identity.
@@ -333,7 +348,10 @@ impl Pst {
         leaf: &mut F,
     ) {
         if depth > MAX_BTREE_DEPTH {
-            self.warnings.push(format!("B-tree deeper than {MAX_BTREE_DEPTH} levels at offset {} — stopped", at.ib));
+            self.warnings.push(format!(
+                "B-tree deeper than {MAX_BTREE_DEPTH} levels at offset {} — stopped",
+                at.ib
+            ));
             return;
         }
         if !seen.insert(at.ib) {
@@ -430,7 +448,9 @@ impl Pst {
             ));
         }
         let mut buf = vec![0u8; total as usize];
-        self.file.seek(SeekFrom::Start(b.ib)).map_err(|e| e.to_string())?;
+        self.file
+            .seek(SeekFrom::Start(b.ib))
+            .map_err(|e| e.to_string())?;
         self.file.read_exact(&mut buf).map_err(|e| e.to_string())?;
 
         // BLOCKTRAILER: cb, wSig, dwCRC, bid. The id catches a block index pointing
@@ -447,7 +467,11 @@ impl Pst {
         // the last two are the inflated length. When it disagrees with the stored length
         // the block is zlib-compressed - which is how a 16MB OST holds far more than
         // 16MB of mail, and is not mentioned anywhere in MS-PST.
-        let inflated = if back == 24 { u16le(&buf, t + 18) as usize } else { b.cb as usize };
+        let inflated = if back == 24 {
+            u16le(&buf, t + 18) as usize
+        } else {
+            b.cb as usize
+        };
         buf.truncate(b.cb as usize);
 
         if bid & 2 == 0 {
@@ -456,7 +480,9 @@ impl Pst {
                 Crypt::Permute => crypt::permute_decode(&mut buf),
                 Crypt::Cyclic => crypt::cyclic(&mut buf, bid),
                 Crypt::Unknown(m) => {
-                    return Err(format!("block {bid} uses unknown encoding method 0x{m:02X}"))
+                    return Err(format!(
+                        "block {bid} uses unknown encoding method 0x{m:02X}"
+                    ))
                 }
             }
         }
@@ -491,7 +517,9 @@ impl Pst {
         let level = first[1];
         let count = u16le(&first, 2) as usize;
         if 8 + count * 8 > first.len() {
-            return Err(format!("XBLOCK {bid} claims {count} entries, which do not fit"));
+            return Err(format!(
+                "XBLOCK {bid} claims {count} entries, which do not fit"
+            ));
         }
         let children: Vec<u64> = (0..count).map(|i| u64le(&first, 8 + i * 8)).collect();
 
@@ -513,10 +541,7 @@ impl Pst {
     ///
     /// Two block types, distinguished by their level: leaves list the subnodes, and the
     /// level above lists more leaves. Both are internal blocks, so neither is obfuscated.
-    ///
-    /// ponytail: a leaf entry also carries a subnode tree of its own, which is skipped.
-    /// Only attachments nest that far, and nothing reads attachments yet.
-    pub fn subnodes(&mut self, bid: u64) -> Result<HashMap<u32, u64>, String> {
+    pub fn subnodes(&mut self, bid: u64) -> Result<HashMap<u32, Sub>, String> {
         let mut out = HashMap::new();
         if bid == 0 {
             return Ok(out);
@@ -525,7 +550,8 @@ impl Pst {
         let mut seen = HashSet::new();
         while let Some(b) = stack.pop() {
             if !seen.insert(b & !1) {
-                self.warnings.push(format!("subnode tree loops back to block {b} — stopped"));
+                self.warnings
+                    .push(format!("subnode tree loops back to block {b} — stopped"));
                 continue;
             }
             let blk = self.block(b)?;
@@ -548,7 +574,13 @@ impl Pst {
             for i in 0..count {
                 let e = 8 + i * width;
                 if level == 0 {
-                    out.insert(u32le(&blk, e), u64le(&blk, e + 8));
+                    out.insert(
+                        u32le(&blk, e),
+                        Sub {
+                            data: u64le(&blk, e + 8),
+                            sub: u64le(&blk, e + 16),
+                        },
+                    );
                 } else {
                     stack.push(u64le(&blk, e + 8));
                 }
@@ -591,17 +623,34 @@ mod tests {
 
     fn survey(name: &str) {
         let Some(mut pst) = open(name) else { return };
-        assert!(matches!(pst.ver, 23 | 36 | 37), "{name}: format version {}", pst.ver);
-        assert!(pst.nbt_root.ib > 0 && pst.bbt_root.ib > 0, "{name} has no B-tree roots");
+        assert!(
+            matches!(pst.ver, 23 | 36 | 37),
+            "{name}: format version {}",
+            pst.ver
+        );
+        assert!(
+            pst.nbt_root.ib > 0 && pst.bbt_root.ib > 0,
+            "{name} has no B-tree roots"
+        );
 
         let nodes = pst.nodes();
         let blocks = pst.blocks();
-        assert!(nodes.len() > 10, "{name}: only {} nodes, walk stopped early", nodes.len());
+        assert!(
+            nodes.len() > 10,
+            "{name}: only {} nodes, walk stopped early",
+            nodes.len()
+        );
         assert!(!blocks.is_empty(), "{name}: no blocks found");
 
         // 0x21 is the message store and 0x122 the root folder. Every intact file has both.
-        assert!(nodes.iter().any(|n| n.nid == 0x21), "{name}: no message store node");
-        assert!(nodes.iter().any(|n| n.nid == 0x122), "{name}: no root folder node");
+        assert!(
+            nodes.iter().any(|n| n.nid == 0x21),
+            "{name}: no message store node"
+        );
+        assert!(
+            nodes.iter().any(|n| n.nid == 0x122),
+            "{name}: no root folder node"
+        );
 
         // Every node's data block must actually exist in the block B-tree.
         let known: HashSet<u64> = blocks.iter().map(|b| b.bid & !1).collect();
@@ -609,7 +658,10 @@ mod tests {
             .iter()
             .filter(|n| n.bid_data != 0 && !known.contains(&(n.bid_data & !1)))
             .count();
-        assert_eq!(orphans, 0, "{name}: {orphans} nodes point at missing blocks");
+        assert_eq!(
+            orphans, 0,
+            "{name}: {orphans} nodes point at missing blocks"
+        );
 
         assert!(pst.warnings.is_empty(), "{name}: {:?}", pst.warnings);
     }
@@ -656,13 +708,18 @@ mod tests {
         );
         // The header and both B-tree roots live near the front, so the survey should
         // still recover the node list even though most of the mail is gone.
-        assert!(!nodes.is_empty(), "gave up entirely on a file with an intact header");
+        assert!(
+            !nodes.is_empty(),
+            "gave up entirely on a file with an intact header"
+        );
         let _ = std::fs::remove_file(cut);
     }
 
     #[test]
     fn rejects_a_file_that_is_not_a_pst() {
-        let e = Pst::open("Cargo.toml").err().expect("Cargo.toml is not a PST");
+        let e = Pst::open("Cargo.toml")
+            .err()
+            .expect("Cargo.toml is not a PST");
         assert!(e.contains("not a PST"), "unhelpful error: {e}");
     }
 }

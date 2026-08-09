@@ -3,10 +3,10 @@
 Read, export and repair Outlook `.pst` and `.ost` files on Windows. No Outlook
 required, no licence, no per-mailbox fee, no fake progress bar. MIT licensed.
 
-**Status: early, and it reads real mail.** Folder tree, message list with senders and
-dates, and every property on any node — out of PST and OST alike, including from a
-password-protected PST without ever asking for the password. It does not write anything
-out yet. See [Progress](#progress).
+**Status: it gets your mail out.** Folder tree, message list, every property on any node,
+and `--export` writes the whole mailbox to `.eml` files any mail client will open — out of
+PST and OST alike, including from a password-protected PST without ever asking for the
+password. Repair beyond the truncation case is still ahead. See [Progress](#progress).
 
 Sibling project to [vncfree](https://github.com/sp00nznet/vncfree), same attitude:
 find the Windows payware, read the published spec it is hiding behind, give it away.
@@ -180,6 +180,39 @@ node 0x200184, message, 69 properties, 2 fetched from the subnode tree
   ...
 ```
 
+### Getting the mail out
+
+```
+> pstfree.exe mailbox.ost --export .\mail
+3 message(s) written to .\mail
+
+.\mail\Root - Mailbox\IPM_SUBTREE\Inbox\Microsoft Outlook Test Message.eml
+.\mail\Root - Mailbox\IPM_SUBTREE\Inbox\Microsoft Outlook Test Message (0x2000E4).eml
+.\mail\Root - Mailbox\IPM_SUBTREE\Sent Items\Test 2.eml
+```
+
+One directory per folder, one `.eml` per message — RFC 5322 with MIME, which Thunderbird,
+Outlook, `mutt` and everything else will open. Attachments are included as MIME parts.
+
+**Where the message carries its original internet headers, those are what gets written** —
+the real `From`, the real `Message-ID`, the full `Received` chain, exactly as it arrived.
+Only the headers describing the old body layout are replaced, because the body is being
+re-encoded. Where a message has no such headers, they are rebuilt from its properties.
+
+Two rules run through the exporter:
+
+- **Nothing is invented.** No timezone is claimed that the file does not record, so dates
+  are written `+0000`. A body's character set is declared as the message itself declares
+  it and passed through rather than transcoded on a guess, because re-encoding on a guess
+  is how mojibake gets baked in permanently.
+- **Nothing stops.** One unreadable message does not end the export — it is counted,
+  named, and the rest are written. The file that needs exporting is the broken one.
+
+A message whose folder is missing is written to `_no-folder` rather than skipped: in a
+damaged file that is the one most worth keeping. Two messages sharing a subject in one
+folder get the node id appended, because silently overwriting the first one would destroy
+mail.
+
 `--nodes` and `--blocks` dump the two B-trees entry by entry.
 
 ### It does not stop at the first bad byte
@@ -208,8 +241,8 @@ index that pointed at it is caught rather than parsed.
 attachments, embedded messages, plain/HTML/compressed-RTF bodies, calendar and contacts.
 Password ignored, because there is nothing there to ignore.
 
-**Export** — `.eml` and `.msg` per message, `.mbox` per folder, attachments to disk,
-and a manifest. Rebuild a clean `.pst` from a damaged one.
+**Export** — `.eml` per message with attachments inline, mirroring the folder tree.
+`.mbox` and `.msg` to follow, and rebuilding a clean `.pst` from a damaged one.
 
 **Repair** — the differentiator, and the only genuinely hard part:
 
@@ -227,6 +260,14 @@ own undocumented local store. Reading a file is a different job from being a mai
 Honest list of what hasn't been checked yet. These get answered before any of them get
 promised.
 
+- **Attachment extraction has never seen a real attachment.** Not one of the three
+  fixtures has any, so the code that pulls them out of the subnode tree is written and the
+  MIME assembly around it is unit-tested, but the extraction itself has never run against
+  real data. Treat it as unproven until a file with attachments turns up.
+- **Recipients come from the display-name properties, not the recipient table.** So `To:`
+  and `Cc:` on a rebuilt header carry the names Outlook showed rather than the addresses.
+  Messages that kept their original internet headers — most received mail — are unaffected,
+  because those are written through verbatim. Fixing it properly means table contexts.
 - **`PidTagBody` (`0x1000`) is absent from all three fixtures.** The HTML body
   (`PidTagHtml`, `0x1013`) is there and correct — it scales with the message, 114 bytes
   for a short one and 5816 for a long one. But the plain-text body turns up under
@@ -292,14 +333,15 @@ Updated as things land. Nothing is claimed here until it runs.
 | 2 | Blocks: both ciphers, zlib, heaps and property contexts | ✅ done |
 | 3a | The folder tree, with names and message counts | ✅ done |
 | 3b | Subnode trees, message properties, `--list` and `--props` | ✅ done |
-| 3c | Table contexts, then attachments | ⬜ not started |
-| 4b | Export — eml / msg / mbox | 🟡 next |
+| 4b | Export — `.eml` with MIME, folder tree, attachments | ✅ done |
+| 3c | Table contexts, for recipients and a second opinion on membership | ⬜ not started |
+| 4c | Export to `.mbox` and `.msg` | ⬜ not started |
 | 5b | Page and block CRCs, to separate wrong pages from rotten ones | ⬜ not started |
 | 6 | Rebuild torn B-trees | ⬜ not started |
 | 7 | Carve orphaned nodes | ⬜ not started |
 | 8 | GUI | ⬜ not started |
 
-18 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
+27 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
 the public fixtures from freepst, fetched by `tests\fetch-fixtures.ps1`. Test files are
 not committed, because real PSTs contain real mail; the tests skip rather than fail when
 they are absent.

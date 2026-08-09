@@ -1,16 +1,16 @@
 mod crypt;
+mod export;
 mod ltp;
 mod ndb;
 
 use ltp::{
-    clean_subject, filetime, read_pc, PID_CONTENT_COUNT, PID_DELIVERY_TIME, PID_DISPLAY_NAME,
-    PID_MESSAGE_SIZE, PID_SENDER_NAME, PID_SUBJECT, PID_SUBMIT_TIME, PID_UNREAD_COUNT,
+    clean_subject, filetime, read_node_pc, NID_ROOT_FOLDER, PID_CONTENT_COUNT, PID_DELIVERY_TIME,
+    PID_DISPLAY_NAME, PID_MESSAGE_SIZE, PID_SENDER_NAME, PID_SUBJECT, PID_SUBMIT_TIME,
+    PID_UNREAD_COUNT,
 };
 use ndb::{nid_type_name, Crypt, Node, Pst};
 use std::collections::BTreeMap;
 
-/// NID of the root folder. Fixed by the specification, the same in every file.
-const NID_ROOT_FOLDER: u32 = 0x122;
 const NID_TYPE_FOLDER: u8 = 0x02;
 const NID_TYPE_MESSAGE: u8 = 0x04;
 
@@ -21,6 +21,7 @@ pstfree - read, export and repair Outlook PST/OST files
   pstfree <file.pst> --tree     the folder tree, with names and message counts
   pstfree <file.pst> --list     every message: date, folder, sender, subject
   pstfree <file.pst> --props <nid>   every property on one node, as stored
+  pstfree <file.pst> --export <dir>  write every message out as a .eml file
   pstfree <file.pst> --nodes    every node in the file
   pstfree <file.pst> --blocks   every block in the file
 
@@ -53,8 +54,12 @@ fn main() {
         Some("--tree") => tree(&mut pst, &nodes),
         Some("--list") => list(&mut pst, &nodes),
         Some("--props") => props(&mut pst, &nodes, args.get(2).map(String::as_str)),
+        Some("--export") => run_export(&mut pst, &nodes, args.get(2).map(String::as_str)),
         Some("--nodes") => {
-            println!("{:>10}  {:<26} {:>10}  {:>18} {:>18}", "nid", "type", "parent", "data block", "sub block");
+            println!(
+                "{:>10}  {:<26} {:>10}  {:>18} {:>18}",
+                "nid", "type", "parent", "data block", "sub block"
+            );
             for n in &nodes {
                 println!(
                     "{:>10}  {:<26} {:>10}  {:>18} {:>18}",
@@ -67,7 +72,10 @@ fn main() {
             }
         }
         Some("--blocks") => {
-            println!("{:>18} {:>14} {:>8} {:>6}", "bid", "offset", "bytes", "refs");
+            println!(
+                "{:>18} {:>14} {:>8} {:>6}",
+                "bid", "offset", "bytes", "refs"
+            );
             for b in &blocks {
                 println!("{:>18} {:>14} {:>8} {:>6}", b.bid, b.ib, b.cb, b.cref);
             }
@@ -87,12 +95,22 @@ fn folders(pst: &mut Pst, nodes: &[Node]) -> (BTreeMap<u32, String>, BTreeMap<u3
     let mut unreadable = 0;
 
     for n in nodes.iter().filter(|n| n.nid_type() == NID_TYPE_FOLDER) {
-        match read_pc(pst, n) {
+        match read_node_pc(pst, n) {
             Ok(pc) => {
                 // The root folder carries no display name in any file; it is the anchor
                 // the rest hangs off, not something Outlook ever shows.
-                let fallback = if n.nid == NID_ROOT_FOLDER { "(root)" } else { "(unnamed)" };
-                let name = pc.str(PID_DISPLAY_NAME).unwrap_or(fallback).to_string();
+                let fallback = if n.nid == NID_ROOT_FOLDER {
+                    "(root)"
+                } else {
+                    "(unnamed)"
+                };
+                // An empty display name is as good as no display name, and a folder named
+                // "" would otherwise become a directory with no name at all.
+                let name = pc
+                    .str(PID_DISPLAY_NAME)
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(fallback)
+                    .to_string();
                 let count = pc.int(PID_CONTENT_COUNT).unwrap_or(0);
                 let unread = pc.int(PID_UNREAD_COUNT).unwrap_or(0);
                 labelled.insert(
@@ -122,12 +140,18 @@ fn list(pst: &mut Pst, nodes: &[Node]) {
     let mut unreadable = 0;
 
     for n in nodes.iter().filter(|n| n.nid_type() == NID_TYPE_MESSAGE) {
-        match read_pc(pst, n) {
+        match read_node_pc(pst, n) {
             Ok(pc) => {
-                let when = pc.time(PID_DELIVERY_TIME).or(pc.time(PID_SUBMIT_TIME)).unwrap_or(0);
+                let when = pc
+                    .time(PID_DELIVERY_TIME)
+                    .or(pc.time(PID_SUBMIT_TIME))
+                    .unwrap_or(0);
                 rows.push((
                     when,
-                    folder.get(&n.nid_parent).cloned().unwrap_or_else(|| "(no folder)".into()),
+                    folder
+                        .get(&n.nid_parent)
+                        .cloned()
+                        .unwrap_or_else(|| "(no folder)".into()),
                     pc.str(PID_SENDER_NAME).unwrap_or("").to_string(),
                     clean_subject(pc.str(PID_SUBJECT).unwrap_or("(no subject)")).to_string(),
                     pc.int(PID_MESSAGE_SIZE).unwrap_or(0),
@@ -141,19 +165,60 @@ fn list(pst: &mut Pst, nodes: &[Node]) {
     }
 
     rows.sort_by(|a, b| b.0.cmp(&a.0));
-    println!("{:<16}  {:<22}  {:<20}  {}", "date", "folder", "from", "subject");
+    println!(
+        "{:<16}  {:<22}  {:<20}  {}",
+        "date", "folder", "from", "subject"
+    );
     for (when, folder, from, subject, size) in &rows {
         println!(
             "{}  {:<22}  {:<20}  {subject}{}",
             filetime(*when),
             trim(folder, 22),
             trim(from, 20),
-            if *size > 0 { format!("  [{size} bytes]") } else { String::new() }
+            if *size > 0 {
+                format!("  [{size} bytes]")
+            } else {
+                String::new()
+            }
         );
     }
     println!("\n{} message(s).", rows.len());
     if unreadable > 0 {
         println!("{unreadable} could not be read; see above.");
+    }
+}
+
+fn run_export(pst: &mut Pst, nodes: &[Node], dir: Option<&str>) {
+    let Some(dir) = dir else {
+        eprintln!("--export needs a directory to write into, e.g. --export .\\mail");
+        std::process::exit(2);
+    };
+    let root = std::path::Path::new(dir);
+    // Refusing to write into a directory that already has things in it: an export is
+    // hundreds of files and merging it into someone's existing folder is not undoable.
+    if root.read_dir().is_ok_and(|mut d| d.next().is_some()) {
+        eprintln!("{dir} already exists and is not empty. Give me a new directory.");
+        std::process::exit(1);
+    }
+
+    let (names, _, _) = folders(pst, nodes);
+    let st = export::export(pst, nodes, &names, root);
+
+    println!("{} message(s) written to {dir}", st.messages);
+    if st.attachments > 0 {
+        println!("{} attachment(s) included.", st.attachments);
+    }
+    if st.failed > 0 {
+        println!("\n{} message(s) could not be written:", st.failed);
+        for e in &st.errors {
+            println!("  - {e}");
+        }
+    }
+    if !pst.warnings.is_empty() {
+        println!("\n{} problem(s) in the file itself:", pst.warnings.len());
+        for w in &pst.warnings {
+            println!("  - {w}");
+        }
     }
 }
 
@@ -172,7 +237,7 @@ fn props(pst: &mut Pst, nodes: &[Node], want: Option<&str>) {
         std::process::exit(1);
     };
 
-    match read_pc(pst, node) {
+    match read_node_pc(pst, node) {
         Err(e) => eprintln!("0x{nid:X}: {e}"),
         Ok(pc) => {
             println!(
@@ -233,7 +298,11 @@ fn tree(pst: &mut Pst, nodes: &[Node]) {
     // is missing is exactly what a damaged file looks like, and it must not vanish.
     let mut shown = std::collections::HashSet::new();
     print_branch(NID_ROOT_FOLDER, 0, &name, &children, &mut shown);
-    let orphans: Vec<u32> = name.keys().copied().filter(|n| !shown.contains(n)).collect();
+    let orphans: Vec<u32> = name
+        .keys()
+        .copied()
+        .filter(|n| !shown.contains(n))
+        .collect();
     if !orphans.is_empty() {
         println!("\n{} folder(s) not reachable from the root:", orphans.len());
         for o in orphans {
@@ -266,7 +335,11 @@ fn print_branch(
 fn summary(path: &str, pst: &Pst, nodes: &[ndb::Node], blocks: &[ndb::Block]) {
     // From the header, not the file name — a renamed file still tells the truth.
     let kind = if pst.is_ost { "OST" } else { "PST" };
-    let pages = if pst.ver >= 36 { "4K pages" } else { "512-byte pages" };
+    let pages = if pst.ver >= 36 {
+        "4K pages"
+    } else {
+        "512-byte pages"
+    };
     println!("{path}");
     println!("  {kind}, Unicode format (version {}, {pages})", pst.ver);
     println!(
@@ -278,7 +351,8 @@ fn summary(path: &str, pst: &Pst, nodes: &[ndb::Node], blocks: &[ndb::Block]) {
         match pst.crypt {
             Crypt::None => "none".to_string(),
             Crypt::Permute => "permute - a fixed substitution table, no key".to_string(),
-            Crypt::Cyclic => "cyclic - a fixed table keyed off the block id, not a password".to_string(),
+            Crypt::Cyclic =>
+                "cyclic - a fixed table keyed off the block id, not a password".to_string(),
             Crypt::Unknown(b) => format!("unrecognised (0x{b:02X})"),
         }
     );
@@ -289,7 +363,11 @@ fn summary(path: &str, pst: &Pst, nodes: &[ndb::Node], blocks: &[ndb::Block]) {
     }
     let bytes: u64 = blocks.iter().map(|b| b.cb as u64).sum();
 
-    println!("\n  {} nodes, {} blocks, {bytes} bytes of block data", nodes.len(), blocks.len());
+    println!(
+        "\n  {} nodes, {} blocks, {bytes} bytes of block data",
+        nodes.len(),
+        blocks.len()
+    );
     for (t, c) in &counts {
         println!("    {c:>7}  0x{t:02X}  {}", nid_type_name(*t));
     }
@@ -303,6 +381,3 @@ fn summary(path: &str, pst: &Pst, nodes: &[ndb::Node], blocks: &[ndb::Block]) {
         }
     }
 }
-
-
-
