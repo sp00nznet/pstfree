@@ -2,19 +2,25 @@ mod crypt;
 mod ltp;
 mod ndb;
 
-use ltp::{Heap, Pc, PID_CONTENT_COUNT, PID_DISPLAY_NAME, PID_UNREAD_COUNT};
+use ltp::{
+    clean_subject, filetime, read_pc, PID_CONTENT_COUNT, PID_DELIVERY_TIME, PID_DISPLAY_NAME,
+    PID_MESSAGE_SIZE, PID_SENDER_NAME, PID_SUBJECT, PID_SUBMIT_TIME, PID_UNREAD_COUNT,
+};
 use ndb::{nid_type_name, Crypt, Node, Pst};
 use std::collections::BTreeMap;
 
 /// NID of the root folder. Fixed by the specification, the same in every file.
 const NID_ROOT_FOLDER: u32 = 0x122;
 const NID_TYPE_FOLDER: u8 = 0x02;
+const NID_TYPE_MESSAGE: u8 = 0x04;
 
 const USAGE: &str = "\
 pstfree - read, export and repair Outlook PST/OST files
 
   pstfree <file.pst>            what is in this file, and what is wrong with it
   pstfree <file.pst> --tree     the folder tree, with names and message counts
+  pstfree <file.pst> --list     every message: date, folder, sender, subject
+  pstfree <file.pst> --props <nid>   every property on one node, as stored
   pstfree <file.pst> --nodes    every node in the file
   pstfree <file.pst> --blocks   every block in the file
 
@@ -45,6 +51,8 @@ fn main() {
 
     match args.get(1).map(String::as_str) {
         Some("--tree") => tree(&mut pst, &nodes),
+        Some("--list") => list(&mut pst, &nodes),
+        Some("--props") => props(&mut pst, &nodes, args.get(2).map(String::as_str)),
         Some("--nodes") => {
             println!("{:>10}  {:<26} {:>10}  {:>18} {:>18}", "nid", "type", "parent", "data block", "sub block");
             for n in &nodes {
@@ -72,44 +80,148 @@ fn main() {
     }
 }
 
-/// The folder tree, built from the node B-tree's own parent pointers.
-///
-/// ponytail: every node records its parent, so the hierarchy falls straight out of the
-/// node list and the folders' own hierarchy tables are never touched. Reading those means
-/// implementing table contexts, which is real work and buys nothing here. It becomes
-/// worth doing for message listings, and for a file damaged badly enough that the parent
-/// pointers disagree with the tables - at which point having both is the point.
-fn tree(pst: &mut Pst, nodes: &[Node]) {
-    let mut name = BTreeMap::new();
-    let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+/// Name and message counts for every folder, read once.
+fn folders(pst: &mut Pst, nodes: &[Node]) -> (BTreeMap<u32, String>, BTreeMap<u32, String>, usize) {
+    let mut plain = BTreeMap::new();
+    let mut labelled = BTreeMap::new();
     let mut unreadable = 0;
 
     for n in nodes.iter().filter(|n| n.nid_type() == NID_TYPE_FOLDER) {
-        children.entry(n.nid_parent).or_default().push(n.nid);
-        let pc = pst.node_blocks(n.bid_data).and_then(Heap::new).and_then(|h| Pc::read(&h));
-        name.insert(
-            n.nid,
-            match pc {
-                Ok(pc) => {
-                    // The root folder carries no display name in any file; it is the
-                    // anchor the rest hangs off, not something Outlook ever shows.
-                    let fallback =
-                        if n.nid == NID_ROOT_FOLDER { "(root)" } else { "(unnamed)" };
-                    let label = pc.str(PID_DISPLAY_NAME).unwrap_or(fallback).to_string();
-                    let count = pc.int(PID_CONTENT_COUNT).unwrap_or(0);
-                    let unread = pc.int(PID_UNREAD_COUNT).unwrap_or(0);
+        match read_pc(pst, n) {
+            Ok(pc) => {
+                // The root folder carries no display name in any file; it is the anchor
+                // the rest hangs off, not something Outlook ever shows.
+                let fallback = if n.nid == NID_ROOT_FOLDER { "(root)" } else { "(unnamed)" };
+                let name = pc.str(PID_DISPLAY_NAME).unwrap_or(fallback).to_string();
+                let count = pc.int(PID_CONTENT_COUNT).unwrap_or(0);
+                let unread = pc.int(PID_UNREAD_COUNT).unwrap_or(0);
+                labelled.insert(
+                    n.nid,
                     match (count, unread) {
-                        (0, _) => label,
-                        (c, 0) => format!("{label}  ({c})"),
-                        (c, u) => format!("{label}  ({c}, {u} unread)"),
-                    }
-                }
-                Err(e) => {
-                    unreadable += 1;
-                    format!("(unreadable: {e})")
-                }
-            },
+                        (0, _) => name.clone(),
+                        (c, 0) => format!("{name}  ({c})"),
+                        (c, u) => format!("{name}  ({c}, {u} unread)"),
+                    },
+                );
+                plain.insert(n.nid, name);
+            }
+            Err(e) => {
+                unreadable += 1;
+                plain.insert(n.nid, "(unreadable)".into());
+                labelled.insert(n.nid, format!("(unreadable: {e})"));
+            }
+        }
+    }
+    (plain, labelled, unreadable)
+}
+
+/// Every message in the file, newest first, with the folder it sits in.
+fn list(pst: &mut Pst, nodes: &[Node]) {
+    let (folder, _, _) = folders(pst, nodes);
+    let mut rows = Vec::new();
+    let mut unreadable = 0;
+
+    for n in nodes.iter().filter(|n| n.nid_type() == NID_TYPE_MESSAGE) {
+        match read_pc(pst, n) {
+            Ok(pc) => {
+                let when = pc.time(PID_DELIVERY_TIME).or(pc.time(PID_SUBMIT_TIME)).unwrap_or(0);
+                rows.push((
+                    when,
+                    folder.get(&n.nid_parent).cloned().unwrap_or_else(|| "(no folder)".into()),
+                    pc.str(PID_SENDER_NAME).unwrap_or("").to_string(),
+                    clean_subject(pc.str(PID_SUBJECT).unwrap_or("(no subject)")).to_string(),
+                    pc.int(PID_MESSAGE_SIZE).unwrap_or(0),
+                ));
+            }
+            Err(e) => {
+                unreadable += 1;
+                eprintln!("message 0x{:X}: {e}", n.nid);
+            }
+        }
+    }
+
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    println!("{:<16}  {:<22}  {:<20}  {}", "date", "folder", "from", "subject");
+    for (when, folder, from, subject, size) in &rows {
+        println!(
+            "{}  {:<22}  {:<20}  {subject}{}",
+            filetime(*when),
+            trim(folder, 22),
+            trim(from, 20),
+            if *size > 0 { format!("  [{size} bytes]") } else { String::new() }
         );
+    }
+    println!("\n{} message(s).", rows.len());
+    if unreadable > 0 {
+        println!("{unreadable} could not be read; see above.");
+    }
+}
+
+/// Every property on one node, exactly as stored. The answer to "what is actually in
+/// this thing", which is the question a damaged file always raises.
+fn props(pst: &mut Pst, nodes: &[Node], want: Option<&str>) {
+    let Some(nid) = want.and_then(|s| {
+        let s = s.trim_start_matches("0x");
+        u32::from_str_radix(s, 16).ok()
+    }) else {
+        eprintln!("--props needs a node id in hex, as printed by --nodes, e.g. --props 200044");
+        std::process::exit(2);
+    };
+    let Some(node) = nodes.iter().find(|n| n.nid == nid) else {
+        eprintln!("no node 0x{nid:X} in this file");
+        std::process::exit(1);
+    };
+
+    match read_pc(pst, node) {
+        Err(e) => eprintln!("0x{nid:X}: {e}"),
+        Ok(pc) => {
+            println!(
+                "node 0x{nid:X}, {}, {} properties, {} fetched from the subnode tree",
+                nid_type_name(node.nid_type()),
+                pc.props.len(),
+                pc.from_subnode
+            );
+            for (id, v) in &pc.props {
+                println!("  0x{id:04X}  {}", describe(v));
+            }
+        }
+    }
+}
+
+fn describe(v: &ltp::Value) -> String {
+    use ltp::Value::*;
+    match v {
+        Int(i) => format!("int          {i}"),
+        Float(f) => format!("float        {f}"),
+        Bool(b) => format!("bool         {b}"),
+        Time(t) => format!("time         {}", filetime(*t)),
+        Str(s) => format!("string       {:?}", trim(s, 60)),
+        Bytes(b) => format!("binary       {} bytes", b.len()),
+        MissingSubnode(n) => format!("MISSING      subnode 0x{n:08X} is not in the subnode tree"),
+        Raw { ptype, bytes } => format!("type 0x{ptype:04X}   {} bytes", bytes.len()),
+    }
+}
+
+fn trim(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    s.chars().take(n - 1).collect::<String>() + "…"
+}
+
+/// The folder tree, built from the node B-tree's own parent pointers.
+///
+/// ponytail: every node records its parent, so both the hierarchy here and each message's
+/// containing folder in `list` fall straight out of the node list, and the folders' own
+/// hierarchy and contents tables are never touched. Reading those means implementing
+/// table contexts, which is real work and buys nothing yet. They become worth doing for
+/// attachments, and for a file damaged badly enough that the parent pointers and the
+/// tables disagree - at which point having both is exactly the point.
+fn tree(pst: &mut Pst, nodes: &[Node]) {
+    let (_, name, unreadable) = folders(pst, nodes);
+    let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for n in nodes.iter().filter(|n| n.nid_type() == NID_TYPE_FOLDER) {
+        children.entry(n.nid_parent).or_default().push(n.nid);
     }
 
     if name.is_empty() {
@@ -191,4 +303,6 @@ fn summary(path: &str, pst: &Pst, nodes: &[ndb::Node], blocks: &[ndb::Block]) {
         }
     }
 }
+
+
 

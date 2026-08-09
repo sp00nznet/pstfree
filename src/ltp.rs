@@ -9,7 +9,7 @@
 //! blocks which are not there. Each of those is an error naming what was wrong, never a
 //! panic and never a silent empty answer.
 
-use crate::ndb::{u16le, u32le};
+use crate::ndb::{u16le, u32le, Node, Pst};
 use std::collections::BTreeMap;
 
 /// Marks the start of a heap. First byte of any heap-on-node.
@@ -23,6 +23,13 @@ const BTH_SIGNATURE: u8 = 0xB5;
 pub const PID_DISPLAY_NAME: u16 = 0x3001;
 pub const PID_CONTENT_COUNT: u16 = 0x3602;
 pub const PID_UNREAD_COUNT: u16 = 0x3603;
+
+// ...and for listing messages.
+pub const PID_SUBJECT: u16 = 0x0037;
+pub const PID_SENDER_NAME: u16 = 0x0C1A;
+pub const PID_DELIVERY_TIME: u16 = 0x0E06;
+pub const PID_SUBMIT_TIME: u16 = 0x0039;
+pub const PID_MESSAGE_SIZE: u16 = 0x0E08;
 
 /// A heap spread over a node's blocks.
 pub struct Heap {
@@ -148,74 +155,181 @@ fn bth_records(heap: &Heap) -> Result<(usize, Vec<Vec<u8>>), String> {
 #[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
+    Float(f64),
     Bool(bool),
     Str(String),
     Bytes(Vec<u8>),
-    /// Too big for the heap, so it lives in the node's subnode tree. Not read yet.
-    InSubnode(u32),
-    /// A type this layer does not decode yet, kept so nothing is silently dropped.
-    Raw { ptype: u16, value: u32 },
+    /// 100-nanosecond ticks since 1601, which is how Windows keeps time.
+    Time(u64),
+    /// The value said it lived in a subnode that the node's subnode tree does not list.
+    /// Recorded rather than dropped, because in a damaged file this is the interesting
+    /// case: the property survived and its contents did not.
+    MissingSubnode(u32),
+    /// A type this layer does not decode yet, kept so nothing is silently lost.
+    Raw { ptype: u16, bytes: Vec<u8> },
 }
 
 /// A property context: every property on a folder, message or attachment.
-pub struct Pc(pub BTreeMap<u16, Value>);
+pub struct Pc {
+    pub props: BTreeMap<u16, Value>,
+    /// How many values were too big for the heap and had to be fetched from the node's
+    /// subnode tree. Worth reporting: it is the difference between a node that is
+    /// self-contained and one whose contents live somewhere else in the file.
+    pub from_subnode: usize,
+}
 
-impl Pc {
-    pub fn read(heap: &Heap) -> Result<Pc, String> {
-        if heap.client_sig != CLIENT_SIG_PC {
-            return Err(format!(
-                "heap holds client type 0x{:02X}, not a property context",
-                heap.client_sig
-            ));
-        }
-        let (key, records) = bth_records(heap)?;
-        if key != 2 {
-            return Err(format!("property B-tree has {key}-byte keys, expected 2"));
-        }
+/// Fixed-size types of four bytes or less are stored inline, where a reference would
+/// otherwise go. Everything else is a heap id, or a subnode id.
+fn is_inline(ptype: u16) -> bool {
+    matches!(ptype, 0x0000..=0x0004 | 0x000A | 0x000B)
+}
 
-        let mut props = BTreeMap::new();
-        for r in records {
-            if r.len() < 8 {
-                continue;
-            }
-            let (id, ptype, raw) = (u16le(&r, 0), u16le(&r, 2), u32le(&r, 4));
-            // Fixed-size types of four bytes or less are stored where a reference would
-            // otherwise go. Everything else is a heap id, or a subnode id.
-            let v = match ptype {
-                0x0002 => Value::Int(raw as u16 as i16 as i64),
-                0x0003 | 0x000A => Value::Int(raw as i32 as i64),
-                0x000B => Value::Bool(raw & 1 != 0),
-                0x001F | 0x001E | 0x0102 => match heap.item(raw) {
-                    _ if raw == 0 => Value::Bytes(Vec::new()),
-                    _ if raw & 0x1F != 0 => Value::InSubnode(raw),
-                    Ok(b) if ptype == 0x001F => Value::Str(utf16le(b)),
-                    Ok(b) if ptype == 0x001E => {
-                        Value::Str(b.iter().map(|&c| c as char).collect())
-                    }
-                    Ok(b) => Value::Bytes(b.to_vec()),
-                    Err(e) => return Err(e),
-                },
-                _ => Value::Raw { ptype, value: raw },
-            };
-            props.insert(id, v);
-        }
-        Ok(Pc(props))
+/// Read every property on a node.
+///
+/// Needs the file, not just the heap, because a value too big to fit the heap is stored
+/// out in the node's subnode tree and has to be fetched from there.
+pub fn read_pc(pst: &mut Pst, node: &Node) -> Result<Pc, String> {
+    let heap = Heap::new(pst.node_blocks(node.bid_data)?)?;
+    if heap.client_sig != CLIENT_SIG_PC {
+        return Err(format!(
+            "heap holds client type 0x{:02X}, not a property context",
+            heap.client_sig
+        ));
+    }
+    let (key, records) = bth_records(&heap)?;
+    if key != 2 {
+        return Err(format!("property B-tree has {key}-byte keys, expected 2"));
     }
 
+    // Only fetched if some property actually points out of the heap, which most do not.
+    let mut subs = None;
+    let mut from_subnode = 0;
+
+    let mut props = BTreeMap::new();
+    for r in records {
+        if r.len() < 8 {
+            continue;
+        }
+        let (id, ptype, raw) = (u16le(&r, 0), u16le(&r, 2), u32le(&r, 4));
+
+        if is_inline(ptype) {
+            props.insert(
+                id,
+                match ptype {
+                    0x0002 => Value::Int(raw as u16 as i16 as i64),
+                    0x0004 => Value::Float(f32::from_bits(raw) as f64),
+                    0x000B => Value::Bool(raw & 1 != 0),
+                    _ => Value::Int(raw as i32 as i64),
+                },
+            );
+            continue;
+        }
+
+        // A heap id has zero in its low five bits; anything else is a subnode id.
+        let bytes = if raw == 0 {
+            Vec::new()
+        } else if raw & 0x1F == 0 {
+            heap.item(raw)?.to_vec()
+        } else {
+            if subs.is_none() {
+                subs = Some(pst.subnodes(node.bid_sub)?);
+            }
+            match subs.as_ref().unwrap().get(&raw) {
+                Some(&data) => {
+                    from_subnode += 1;
+                    pst.node_blocks(data)?.concat()
+                }
+                None => {
+                    props.insert(id, Value::MissingSubnode(raw));
+                    continue;
+                }
+            }
+        };
+
+        props.insert(id, decode(ptype, bytes));
+    }
+    Ok(Pc { props, from_subnode })
+}
+
+fn decode(ptype: u16, b: Vec<u8>) -> Value {
+    let eight = |b: &[u8]| -> Option<u64> {
+        (b.len() >= 8).then(|| u64::from_le_bytes(b[..8].try_into().unwrap()))
+    };
+    match ptype {
+        0x001F => Value::Str(utf16le(&b)),
+        // PtypString8 is in the file's own code page, which is not recorded anywhere in
+        // the file. Treated as Latin-1: right for western text, and never a panic.
+        0x001E => Value::Str(b.iter().map(|&c| c as char).collect()),
+        0x0040 => eight(&b).map(Value::Time).unwrap_or(Value::Raw { ptype, bytes: b }),
+        0x0014 | 0x0006 => {
+            eight(&b).map(|v| Value::Int(v as i64)).unwrap_or(Value::Raw { ptype, bytes: b })
+        }
+        0x0005 | 0x0007 => {
+            eight(&b).map(|v| Value::Float(f64::from_bits(v))).unwrap_or(Value::Raw { ptype, bytes: b })
+        }
+        0x0102 | 0x0048 => Value::Bytes(b),
+        _ => Value::Raw { ptype, bytes: b },
+    }
+}
+
+impl Pc {
     pub fn str(&self, id: u16) -> Option<&str> {
-        match self.0.get(&id) {
+        match self.props.get(&id) {
             Some(Value::Str(s)) => Some(s),
             _ => None,
         }
     }
 
     pub fn int(&self, id: u16) -> Option<i64> {
-        match self.0.get(&id) {
+        match self.props.get(&id) {
             Some(Value::Int(i)) => Some(*i),
             Some(Value::Bool(b)) => Some(*b as i64),
             _ => None,
         }
     }
+
+    pub fn time(&self, id: u16) -> Option<u64> {
+        match self.props.get(&id) {
+            Some(Value::Time(t)) => Some(*t),
+            _ => None,
+        }
+    }
+}
+
+/// A Windows FILETIME as `YYYY-MM-DD HH:MM`.
+///
+/// Done by hand rather than with a date crate: it is one well-known algorithm and the
+/// alternative is a dependency for formatting a number.
+pub fn filetime(ft: u64) -> String {
+    if ft == 0 {
+        return "                ".into();
+    }
+    // FILETIME counts 100ns ticks from 1601; Unix counts seconds from 1970.
+    let unix = ft as i64 / 10_000_000 - 11_644_473_600;
+    let (days, secs) = (unix.div_euclid(86400), unix.rem_euclid(86400));
+
+    // Hinnant's civil-from-days: shift the epoch to 1st March so leap day lands last.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", secs / 3600, secs / 60 % 60)
+}
+
+/// Outlook prefixes a subject with U+0001 and a length byte when it has a "RE:"-style
+/// prefix. Both are control characters that would otherwise be printed.
+pub fn clean_subject(s: &str) -> &str {
+    s.strip_prefix('\u{1}').map_or(s, |rest| {
+        let mut c = rest.chars();
+        c.next();
+        c.as_str()
+    })
 }
 
 /// Outlook stores strings as UTF-16LE. A damaged file can leave an odd trailing byte or
@@ -242,10 +356,7 @@ mod tests {
         let nodes = pst.nodes();
         let mut names = Vec::new();
         for n in nodes.iter().filter(|n| n.nid_type() == 0x02) {
-            let pc = pst
-                .node_blocks(n.bid_data)
-                .and_then(Heap::new)
-                .and_then(|h| Pc::read(&h))
+            let pc = read_pc(&mut pst, n)
                 .unwrap_or_else(|e| panic!("{file} folder 0x{:X}: {e}", n.nid));
             if let Some(s) = pc.str(PID_DISPLAY_NAME) {
                 names.push(s.to_string());
@@ -253,6 +364,79 @@ mod tests {
         }
         assert!(!names.is_empty(), "{file}: no folder names at all");
         names
+    }
+
+    /// Messages are where properties outgrow the node's own heap, so this is the check
+    /// that the subnode tree is actually walked and not merely present.
+    #[test]
+    fn reads_properties_out_of_the_subnode_tree() {
+        let path = "tests/data/example-2013.ost";
+        if !std::path::Path::new(path).exists() {
+            return;
+        }
+        let mut pst = Pst::open(path).unwrap();
+        let nodes = pst.nodes();
+        let mut fetched = 0;
+        for n in nodes.iter().filter(|n| n.nid_type() == 0x04) {
+            let pc = read_pc(&mut pst, n).unwrap();
+            fetched += pc.from_subnode;
+            // A value that says it lives in a subnode, in a node whose subnode tree does
+            // not list it, means the walk is wrong or the file is damaged. Neither is
+            // true of these fixtures, so it must not happen.
+            assert!(
+                !pc.props.values().any(|v| matches!(v, Value::MissingSubnode(_))),
+                "message 0x{:X} points at a subnode that is not in its subnode tree",
+                n.nid
+            );
+        }
+        assert!(fetched > 0, "not one property came out of a subnode tree");
+    }
+
+    /// Every message in a fixture, through the subnode tree where the value needs it.
+    #[test]
+    fn reads_messages() {
+        for file in ["passworded.pst", "dist-list.pst", "example-2013.ost"] {
+            let path = format!("tests/data/{file}");
+            if !std::path::Path::new(&path).exists() {
+                continue;
+            }
+            let mut pst = Pst::open(&path).unwrap();
+            let nodes = pst.nodes();
+            let (mut seen, mut timed) = (0, 0);
+            for n in nodes.iter().filter(|n| n.nid_type() == 0x04) {
+                let pc = read_pc(&mut pst, n)
+                    .unwrap_or_else(|e| panic!("{file} message 0x{:X}: {e}", n.nid));
+                assert!(
+                    pc.props.contains_key(&PID_SUBJECT),
+                    "{file} message 0x{:X} has no subject property",
+                    n.nid
+                );
+                // Not every message node is mail. Outlook keeps internal objects like
+                // LocalFreebusy in here too, and those have no delivery or submit time.
+                if pc.time(PID_DELIVERY_TIME).or(pc.time(PID_SUBMIT_TIME)).is_some() {
+                    timed += 1;
+                }
+                seen += 1;
+            }
+            assert!(seen > 0, "{file}: no messages found");
+            assert!(timed > 0, "{file}: not one of {seen} messages had a readable timestamp");
+        }
+    }
+
+    #[test]
+    fn formats_a_filetime() {
+        // 2024-01-01T00:00:00Z is 13348540800 seconds after 1601.
+        assert_eq!(filetime(133_485_408_000_000_000), "2024-01-01 00:00");
+        // One tick before the next day, to catch an off-by-one in the day split.
+        assert_eq!(filetime(133_486_271_999_999_999), "2024-01-01 23:59");
+        assert_eq!(filetime(0).trim(), "");
+    }
+
+    #[test]
+    fn strips_the_subject_prefix_marker() {
+        assert_eq!(clean_subject("\u{1}\u{5}RE: hello"), "RE: hello");
+        assert_eq!(clean_subject("plain"), "plain");
+        assert_eq!(clean_subject(""), "");
     }
 
     /// The whole point, in one test: a "password-protected" PST gives up its folder
@@ -310,3 +494,4 @@ mod tests {
         assert_eq!(utf16le(&[0x41, 0x00, 0x42]), "A");
     }
 }
+

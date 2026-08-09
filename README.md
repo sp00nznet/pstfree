@@ -3,9 +3,10 @@
 Read, export and repair Outlook `.pst` and `.ost` files on Windows. No Outlook
 required, no licence, no per-mailbox fee, no fake progress bar. MIT licensed.
 
-**Status: early.** It opens PST and OST files and prints the folder tree with real names
-and message counts — including from a password-protected PST, without ever asking for the
-password. It does not read individual messages yet. See [Progress](#progress).
+**Status: early, and it reads real mail.** Folder tree, message list with senders and
+dates, and every property on any node — out of PST and OST alike, including from a
+password-protected PST without ever asking for the password. It does not write anything
+out yet. See [Progress](#progress).
 
 Sibling project to [vncfree](https://github.com/sp00nznet/vncfree), same attitude:
 find the Windows payware, read the published spec it is hiding behind, give it away.
@@ -155,6 +156,30 @@ Without `--tree` it surveys the file instead:
   No structural damage found.
 ```
 
+`--list` is every message in the file, newest first:
+
+```
+> pstfree.exe mailbox.ost --list
+date              folder                  from                  subject
+2014-06-05 16:22  Inbox                   Microsoft Outlook     Microsoft Outlook Test Message  [7110 bytes]
+2014-04-09 19:54  Inbox                   Microsoft Outlook     Microsoft Outlook Test Message  [7016 bytes]
+2014-04-09 16:38  Sent Items              Bernard Chung         Test 2  [12390 bytes]
+```
+
+`--props <nid>` is every property on one node, exactly as stored — the answer to "what is
+actually in this thing", which is the question a damaged file always raises:
+
+```
+> pstfree.exe mailbox.ost --props 200184
+node 0x200184, message, 69 properties, 2 fetched from the subnode tree
+  0x0037  string       "Test 2"
+  0x0039  time         2014-04-09 16:38
+  0x007D  string       "Return-Path: <someone@example.com>\r\nDelivered-To…"
+  0x0C1A  string       "Bernard Chung"
+  0x1013  binary       5816 bytes
+  ...
+```
+
 `--nodes` and `--blocks` dump the two B-trees entry by entry.
 
 ### It does not stop at the first bad byte
@@ -202,6 +227,15 @@ own undocumented local store. Reading a file is a different job from being a mai
 Honest list of what hasn't been checked yet. These get answered before any of them get
 promised.
 
+- **`PidTagBody` (`0x1000`) is absent from all three fixtures.** The HTML body
+  (`PidTagHtml`, `0x1013`) is there and correct — it scales with the message, 114 bytes
+  for a short one and 5816 for a long one. But the plain-text body turns up under
+  `0x6619`, which MS-OXPROPS assigns to something else entirely. Property ids either side
+  of it decode correctly, so this is not a misaligned read; these files genuinely put it
+  there. Export needs this settled, and it wants more than three sample files first.
+- **Named properties (`0x8000` and up) are shown by number, not by name.** Resolving them
+  means reading the name-to-id map in node `0x61`. They are visible and intact in
+  `--props`; they just have no labels yet.
 - **`NDB_CRYPT_CYCLIC` is implemented but has never decoded a real file.** No fixture uses
   it. The specification calls it a symmetric cipher and the test checks that running it
   twice returns the original bytes, which is the only evidence behind it. Permute is
@@ -257,14 +291,15 @@ Updated as things land. Nothing is claimed here until it runs.
 | 5a | Damage report — truncation, bad pages, loops, wrong ids | ✅ done |
 | 2 | Blocks: both ciphers, zlib, heaps and property contexts | ✅ done |
 | 3a | The folder tree, with names and message counts | ✅ done |
-| 3b | Table contexts, then messages, bodies and attachments | 🟡 next |
-| 4b | Export — eml / msg / mbox | ⬜ not started |
+| 3b | Subnode trees, message properties, `--list` and `--props` | ✅ done |
+| 3c | Table contexts, then attachments | ⬜ not started |
+| 4b | Export — eml / msg / mbox | 🟡 next |
 | 5b | Page and block CRCs, to separate wrong pages from rotten ones | ⬜ not started |
 | 6 | Rebuild torn B-trees | ⬜ not started |
 | 7 | Carve orphaned nodes | ⬜ not started |
 | 8 | GUI | ⬜ not started |
 
-14 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
+18 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
 the public fixtures from freepst, fetched by `tests\fetch-fixtures.ps1`. Test files are
 not committed, because real PSTs contain real mail; the tests skip rather than fail when
 they are absent.

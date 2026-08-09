@@ -506,6 +506,57 @@ impl Pst {
         Ok(out)
     }
 
+    /// A node's subnode tree, flattened to local id -> the block holding its data.
+    ///
+    /// Anything too big for a node's own heap — long message bodies, every attachment —
+    /// lives out here under its own local id.
+    ///
+    /// Two block types, distinguished by their level: leaves list the subnodes, and the
+    /// level above lists more leaves. Both are internal blocks, so neither is obfuscated.
+    ///
+    /// ponytail: a leaf entry also carries a subnode tree of its own, which is skipped.
+    /// Only attachments nest that far, and nothing reads attachments yet.
+    pub fn subnodes(&mut self, bid: u64) -> Result<HashMap<u32, u64>, String> {
+        let mut out = HashMap::new();
+        if bid == 0 {
+            return Ok(out);
+        }
+        let mut stack = vec![bid];
+        let mut seen = HashSet::new();
+        while let Some(b) = stack.pop() {
+            if !seen.insert(b & !1) {
+                self.warnings.push(format!("subnode tree loops back to block {b} — stopped"));
+                continue;
+            }
+            let blk = self.block(b)?;
+            if blk.len() < 8 || blk[0] != 0x02 {
+                return Err(format!(
+                    "block {b} is not a subnode block: type byte is 0x{:02X}, expected 0x02",
+                    blk.first().copied().unwrap_or(0)
+                ));
+            }
+            let level = blk[1];
+            let count = u16le(&blk, 2) as usize;
+            // SLENTRY is nid, bidData, bidSub. SIENTRY is nid and the block below it.
+            let width = if level == 0 { 24 } else { 16 };
+            if 8 + count * width > blk.len() {
+                return Err(format!(
+                    "subnode block {b} claims {count} entries of {width} bytes, which do not fit in {}",
+                    blk.len()
+                ));
+            }
+            for i in 0..count {
+                let e = 8 + i * width;
+                if level == 0 {
+                    out.insert(u32le(&blk, e), u64le(&blk, e + 8));
+                } else {
+                    stack.push(u64le(&blk, e + 8));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Every block in the file, in B-tree order.
     pub fn blocks(&mut self) -> Vec<Block> {
         let mut out = Vec::new();
