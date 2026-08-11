@@ -1,0 +1,75 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to attach binaries to a release
+
+jobs:
+  # A published advisory against anything in the tree is something to find out about from
+  # CI rather than from a user. Separate from the build so a new advisory reports itself
+  # without also failing the binaries.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # Without this every run recompiles the whole dependency tree.
+      - uses: Swatinem/rust-cache@v2
+
+      # Real PSTs are never committed here, so without this step almost every test skips
+      # itself and a green tick would mean nothing at all. These are the public fixtures
+      # from hrbrmstr/freepst: a PST, a 2013 OST and a "password-protected" PST.
+      - name: Fetch the test fixtures
+        run: .\tests\fetch-fixtures.ps1
+        shell: pwsh
+
+      # --locked fails if Cargo.lock would change, so CI builds exactly what was committed
+      # rather than silently picking up new dependency versions.
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+
+      # The fuzzer at a higher round count than the suite's default. Release mode because
+      # 400 rounds of parsing three files is slow in a debug build, and this is the one
+      # place where finding a panic matters more than finding it quickly.
+      - name: Fuzz the recovery paths
+        run: cargo test --release --locked --test fuzz
+        env:
+          PSTFREE_FUZZ_ROUNDS: 400
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pstfree-windows-x64
+          path: |
+            target/release/pstfree.exe
+            target/release/pstfree-gui.exe
+
+      # Only on a version tag: publish on the Releases page so people can download without
+      # building, or trusting a binary from anywhere else.
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: |
+            target/release/pstfree.exe
+            target/release/pstfree-gui.exe
+          generate_release_notes: true

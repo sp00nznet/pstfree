@@ -65,11 +65,11 @@ fn main() {
         let instance = GetModuleHandleW(std::ptr::null());
         let class = wide("pstfree_window");
 
-        let mut icc = INITCOMMONCONTROLSEX {
+        let icc = INITCOMMONCONTROLSEX {
             dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
             dwICC: ICC_TREEVIEW_CLASSES | ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES,
         };
-        InitCommonControlsEx(&mut icc);
+        InitCommonControlsEx(&icc);
 
         let wc = WNDCLASSW {
             style: 0,
@@ -182,8 +182,16 @@ unsafe fn create_children(hwnd: HWND) {
         h
     };
 
-    let tree = mk("SysTreeView32", WS_BORDER | TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT, ID_TREE);
-    let list = mk("SysListView32", WS_BORDER | LVS_REPORT | LVS_SINGLESEL, ID_LIST);
+    let tree = mk(
+        "SysTreeView32",
+        WS_BORDER | TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT,
+        ID_TREE,
+    );
+    let list = mk(
+        "SysListView32",
+        WS_BORDER | LVS_REPORT | LVS_SINGLESEL,
+        ID_LIST,
+    );
     let text = mk(
         "EDIT",
         WS_BORDER | WS_VSCROLL | WS_HSCROLL | (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32,
@@ -191,9 +199,15 @@ unsafe fn create_children(hwnd: HWND) {
     );
     let status = mk("msctls_statusbar32", 0, 0);
 
-    SendMessageW(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_FULLROWSELECT as LPARAM);
-    for (i, (title, width)) in
-        [("Date", 130), ("From", 190), ("Subject", 460)].iter().enumerate()
+    SendMessageW(
+        list,
+        LVM_SETEXTENDEDLISTVIEWSTYLE,
+        0,
+        LVS_EX_FULLROWSELECT as LPARAM,
+    );
+    for (i, (title, width)) in [("Date", 130), ("From", 190), ("Subject", 460)]
+        .iter()
+        .enumerate()
     {
         let t = wide(title);
         let col = LVCOLUMNW {
@@ -248,7 +262,10 @@ unsafe fn create_children(hwnd: HWND) {
     AppendMenuW(menu, MF_POPUP, file as usize, f.as_ptr());
     SetMenu(hwnd, menu);
 
-    set_status(hwnd, "Open a .pst or .ost file to begin. No password is ever needed.");
+    set_status(
+        hwnd,
+        "Open a .pst or .ost file to begin. No password is ever needed.",
+    );
 }
 
 /// Left third for the folders, the rest split between the message list and the message.
@@ -304,7 +321,9 @@ unsafe fn command(hwnd: HWND, app: &mut App, id: usize) {
 
 /// The standard open dialog, through the old flat API so no COM is involved.
 unsafe fn pick_file(hwnd: HWND) -> Option<String> {
-    use windows_sys::Win32::UI::Controls::Dialogs::{GetOpenFileNameW, OFN_FILEMUSTEXIST, OPENFILENAMEW};
+    use windows_sys::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, OFN_FILEMUSTEXIST, OPENFILENAMEW,
+    };
 
     let mut buf = [0u16; 1024];
     let filter: Vec<u16> = "Outlook data files\0*.pst;*.ost\0All files\0*.*\0\0"
@@ -326,7 +345,10 @@ unsafe fn pick_file(hwnd: HWND) -> Option<String> {
 
 /// Pick a directory, using the folder-browser rather than the file dialog.
 unsafe fn pick_folder(hwnd: HWND) -> Option<String> {
-    use windows_sys::Win32::UI::Shell::{SHBrowseForFolderW, SHGetPathFromIDListW, BROWSEINFOW, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS};
+    use windows_sys::Win32::UI::Shell::{
+        SHBrowseForFolderW, SHGetPathFromIDListW, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS,
+        BROWSEINFOW,
+    };
 
     let title = wide("Choose an empty folder to export into");
     let mut bi: BROWSEINFOW = std::mem::zeroed();
@@ -334,7 +356,7 @@ unsafe fn pick_folder(hwnd: HWND) -> Option<String> {
     bi.lpszTitle = title.as_ptr();
     bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
 
-    let idl = SHBrowseForFolderW(&mut bi);
+    let idl = SHBrowseForFolderW(&bi);
     if idl.is_null() {
         return None;
     }
@@ -376,7 +398,10 @@ unsafe fn open_file(hwnd: HWND, app: &mut App, path: &str) {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| {
                 if n.nid == NID_ROOT_FOLDER {
-                    path.rsplit(['\\', '/']).next().unwrap_or("(root)").to_string()
+                    path.rsplit(['\\', '/'])
+                        .next()
+                        .unwrap_or("(root)")
+                        .to_string()
                 } else {
                     "(unnamed)".into()
                 }
@@ -387,8 +412,13 @@ unsafe fn open_file(hwnd: HWND, app: &mut App, path: &str) {
     let mut by_folder: BTreeMap<u32, Vec<(Node, String, String, String)>> = BTreeMap::new();
     let mut total = 0;
     for n in nodes.iter().filter(|n| n.nid_type() == 0x04) {
-        let Ok(pc) = read_node_pc(&mut pst, n) else { continue };
-        let when = pc.time(PID_DELIVERY_TIME).or(pc.time(PID_SUBMIT_TIME)).unwrap_or(0);
+        let Ok(pc) = read_node_pc(&mut pst, n) else {
+            continue;
+        };
+        let when = pc
+            .time(PID_DELIVERY_TIME)
+            .or(pc.time(PID_SUBMIT_TIME))
+            .unwrap_or(0);
         by_folder.entry(n.nid_parent).or_default().push((
             *n,
             clean_subject(pc.str(PID_SUBJECT).unwrap_or("(no subject)")).to_string(),
@@ -420,8 +450,16 @@ unsafe fn open_file(hwnd: HWND, app: &mut App, path: &str) {
         &format!(
             "{file} — {} folders, {total} messages{}{}",
             names.len(),
-            if salvaged { ", index rebuilt by sweeping the file" } else { "" },
-            if problems > 0 { format!(", {problems} problem(s) found") } else { String::new() }
+            if salvaged {
+                ", index rebuilt by sweeping the file"
+            } else {
+                ""
+            },
+            if problems > 0 {
+                format!(", {problems} problem(s) found")
+            } else {
+                String::new()
+            }
         ),
     );
 
@@ -449,9 +487,15 @@ unsafe fn fill_tree(app: &mut App, names: &BTreeMap<u32, String>) {
         if !seen.insert(nid) {
             continue;
         }
-        let Some(name) = names.get(&nid) else { continue };
+        let Some(name) = names.get(&nid) else {
+            continue;
+        };
         let count = app.by_folder.get(&nid).map_or(0, Vec::len);
-        let label = if count > 0 { format!("{name}  ({count})") } else { name.clone() };
+        let label = if count > 0 {
+            format!("{name}  ({count})")
+        } else {
+            name.clone()
+        };
         let mut text = wide(&label);
 
         let mut item: TVINSERTSTRUCTW = std::mem::zeroed();
@@ -460,8 +504,8 @@ unsafe fn fill_tree(app: &mut App, names: &BTreeMap<u32, String>) {
         item.Anonymous.item.mask = TVIF_TEXT | TVIF_PARAM;
         item.Anonymous.item.pszText = text.as_mut_ptr();
         item.Anonymous.item.lParam = nid as LPARAM;
-        let h = SendMessageW(app.tree, TVM_INSERTITEMW, 0, &item as *const _ as LPARAM)
-            as *mut c_void;
+        let h =
+            SendMessageW(app.tree, TVM_INSERTITEMW, 0, &item as *const _ as LPARAM) as *mut c_void;
 
         inserted.push((h, nid));
         for &c in children.get(&nid).map(Vec::as_slice).unwrap_or(&[]) {
@@ -521,7 +565,9 @@ unsafe fn notify(app: &mut App, lp: LPARAM) {
 unsafe fn show_folder(app: &mut App, nid: u32) {
     SendMessageW(app.list, LVM_DELETEALLITEMS, 0, 0);
     app.shown.clear();
-    let Some(msgs) = app.by_folder.get(&nid) else { return };
+    let Some(msgs) = app.by_folder.get(&nid) else {
+        return;
+    };
 
     for (i, (node, subject, from, date)) in msgs.iter().enumerate() {
         let mut d = wide(date);
@@ -545,7 +591,9 @@ unsafe fn show_folder(app: &mut App, nid: u32) {
 }
 
 unsafe fn show_message(app: &mut App, row: usize) {
-    let Some(node) = app.shown.get(row).copied() else { return };
+    let Some(node) = app.shown.get(row).copied() else {
+        return;
+    };
     let Some(pst) = app.pst.as_mut() else { return };
 
     let body = match read_node_pc(pst, &node) {
@@ -559,11 +607,16 @@ unsafe fn show_message(app: &mut App, row: usize) {
                 None => {
                     for (label, v) in [
                         ("From", pc.str(PID_SENDER_NAME).unwrap_or("").to_string()),
-                        ("Subject", clean_subject(pc.str(PID_SUBJECT).unwrap_or("")).to_string()),
+                        (
+                            "Subject",
+                            clean_subject(pc.str(PID_SUBJECT).unwrap_or("")).to_string(),
+                        ),
                         (
                             "Date",
                             filetime(
-                                pc.time(PID_DELIVERY_TIME).or(pc.time(PID_SUBMIT_TIME)).unwrap_or(0),
+                                pc.time(PID_DELIVERY_TIME)
+                                    .or(pc.time(PID_SUBMIT_TIME))
+                                    .unwrap_or(0),
                             )
                             .trim()
                             .to_string(),
@@ -617,7 +670,13 @@ unsafe fn do_export(hwnd: HWND, app: &mut App, format: Format) {
             .ok()
             .and_then(|pc| pc.str(PID_DISPLAY_NAME).map(str::to_string))
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| if n.nid == NID_ROOT_FOLDER { "(root)".into() } else { "(unnamed)".into() });
+            .unwrap_or_else(|| {
+                if n.nid == NID_ROOT_FOLDER {
+                    "(root)".into()
+                } else {
+                    "(unnamed)".into()
+                }
+            });
         names.insert(n.nid, name);
     }
 
@@ -625,10 +684,17 @@ unsafe fn do_export(hwnd: HWND, app: &mut App, format: Format) {
     let msg = format!(
         "{} message(s) written to {dir}{}{}",
         st.messages,
-        if st.attachments > 0 { format!("\n{} attachment(s) included.", st.attachments) } else { String::new() },
-        if st.failed > 0 { format!("\n{} could not be written.", st.failed) } else { String::new() }
+        if st.attachments > 0 {
+            format!("\n{} attachment(s) included.", st.attachments)
+        } else {
+            String::new()
+        },
+        if st.failed > 0 {
+            format!("\n{} could not be written.", st.failed)
+        } else {
+            String::new()
+        }
     );
     set_status(hwnd, &msg.replace('\n', " "));
     message_box(hwnd, &msg, "Export finished", MB_ICONINFORMATION);
 }
-

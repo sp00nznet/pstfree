@@ -1,10 +1,10 @@
+use pstfree::export;
 use pstfree::ltp::{
     self, clean_subject, filetime, read_node_pc, read_tc, NID_ROOT_FOLDER, NID_TYPE_CONTENTS_TABLE,
     NID_TYPE_HIERARCHY_TABLE, PID_CONTENT_COUNT, PID_DELIVERY_TIME, PID_DISPLAY_NAME,
     PID_MESSAGE_SIZE, PID_SENDER_NAME, PID_SUBJECT, PID_SUBMIT_TIME, PID_UNREAD_COUNT,
 };
 use pstfree::ndb::{nid_type_name, Block, Crypt, Node, Pst};
-use pstfree::export;
 use std::collections::{BTreeMap, BTreeSet};
 
 const NID_TYPE_FOLDER: u8 = 0x02;
@@ -54,7 +54,7 @@ fn main() {
     let (nodes, blocks) = index(&mut pst, salvage);
 
     match args.get(1).map(String::as_str) {
-        Some("--verify") => return verify(&mut pst, &nodes, &blocks),
+        Some("--verify") => verify(&mut pst, &nodes, &blocks),
         Some("--rebuild") => {
             let Some(out) = args.get(2) else {
                 eprintln!("--rebuild needs somewhere to write, e.g. --rebuild fixed.pst");
@@ -175,8 +175,7 @@ fn index(pst: &mut Pst, salvage: bool) -> (Vec<Node>, Vec<Block>) {
         // of a message. Carving reads the blocks themselves, so it finds what is actually
         // there. The swept entries fill in anything carving missed.
         let carved = pst.carve();
-        let mut merged: BTreeMap<u64, Block> =
-            carved.iter().map(|b| (b.bid & !1, *b)).collect();
+        let mut merged: BTreeMap<u64, Block> = carved.iter().map(|b| (b.bid & !1, *b)).collect();
 
         // Swept entries fill in anything carving missed, but only where the bytes they
         // describe still check out. An entry freed long ago points at space that has been
@@ -272,7 +271,11 @@ fn verify(pst: &mut Pst, nodes: &[Node], blocks: &[Block]) {
 
     let r = pst.scan();
     println!();
-    println!("  {} nodes and {} blocks reachable from the header's index", nodes.len(), blocks.len());
+    println!(
+        "  {} nodes and {} blocks reachable from the header's index",
+        nodes.len(),
+        blocks.len()
+    );
     println!("  {ok} blocks read, {bad} unreadable, {rotten} failed their checksum");
     println!(
         "  {} pages swept, {} of them index pages ({} node, {} block)",
@@ -350,8 +353,14 @@ fn verify(pst: &mut Pst, nodes: &[Node], blocks: &[Block]) {
     if extra.is_empty() {
         println!("  Sweeping finds nothing the index has lost. The two agree.");
     } else {
-        let msgs = extra.iter().filter(|n| n.nid_type() == NID_TYPE_MESSAGE).count();
-        let folders = extra.iter().filter(|n| n.nid_type() == NID_TYPE_FOLDER).count();
+        let msgs = extra
+            .iter()
+            .filter(|n| n.nid_type() == NID_TYPE_MESSAGE)
+            .count();
+        let folders = extra
+            .iter()
+            .filter(|n| n.nid_type() == NID_TYPE_FOLDER)
+            .count();
         println!(
             "  Sweeping recovers {} node(s) the index cannot reach — {msgs} message(s), {folders} folder(s).",
             extra.len()
@@ -446,10 +455,7 @@ fn list(pst: &mut Pst, nodes: &[Node]) {
     }
 
     rows.sort_by(|a, b| b.0.cmp(&a.0));
-    println!(
-        "{:<16}  {:<22}  {:<20}  {}",
-        "date", "folder", "from", "subject"
-    );
+    println!("{:<16}  {:<22}  {:<20}  subject", "date", "folder", "from");
     for (when, folder, from, subject, size) in &rows {
         println!(
             "{}  {:<22}  {:<20}  {subject}{}",

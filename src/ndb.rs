@@ -61,7 +61,11 @@ const CRC_TABLE: [u32; 256] = {
         let mut c = i as u32;
         let mut k = 0;
         while k < 8 {
-            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
             k += 1;
         }
         t[i] = c;
@@ -305,7 +309,9 @@ impl Pst {
         if self.warnings.len() < MAX_WARNINGS {
             self.warnings.push(msg);
         } else if self.warnings.len() == MAX_WARNINGS {
-            self.warnings.push(format!("(more than {MAX_WARNINGS} problems; the rest are counted but not listed)"));
+            self.warnings.push(format!(
+                "(more than {MAX_WARNINGS} problems; the rest are counted but not listed)"
+            ));
         }
         self.suppressed += 1;
     }
@@ -376,8 +382,16 @@ impl Pst {
         // the B-tree roots read below cannot be trusted at all, which is exactly the case
         // where scanning the file beats following them.
         for (name, stored, range) in [
-            ("partial", u32le(&h, OFF_CRC_PARTIAL), OFF_CRC_RANGE_START..OFF_CRC_PARTIAL_END),
-            ("full", u32le(&h, OFF_CRC_FULL), OFF_CRC_RANGE_START..OFF_CRC_FULL_END),
+            (
+                "partial",
+                u32le(&h, OFF_CRC_PARTIAL),
+                OFF_CRC_RANGE_START..OFF_CRC_PARTIAL_END,
+            ),
+            (
+                "full",
+                u32le(&h, OFF_CRC_FULL),
+                OFF_CRC_RANGE_START..OFF_CRC_FULL_END,
+            ),
         ] {
             let found = crc32(&h[range]);
             if found != stored {
@@ -876,13 +890,7 @@ impl Pst {
             // subnode tree for one node out of 129. Block ids come off a counter that only
             // ever goes up, so the same argument that makes bid_data a good signal makes
             // bid_sub one too.
-            v.sort_by_key(|(_, n)| {
-                (
-                    live.contains_key(&(n.bid_data & !1)),
-                    n.bid_data,
-                    n.bid_sub,
-                )
-            });
+            v.sort_by_key(|(_, n)| (live.contains_key(&(n.bid_data & !1)), n.bid_data, n.bid_sub));
             let pick = v.last().unwrap().1;
 
             // Duplicate copies of the *same* entry are the normal case and say nothing —
@@ -959,7 +967,15 @@ impl Pst {
                     && self.file.read_exact(&mut buf).is_ok()
                     && crc32(&buf) == u32le(&trailer, 4)
                 {
-                    found.insert(bid & !1, Block { bid, ib: begin, cb: cb as u16, cref: 0 });
+                    found.insert(
+                        bid & !1,
+                        Block {
+                            bid,
+                            ib: begin,
+                            cb: cb as u16,
+                            cref: 0,
+                        },
+                    );
                 }
             }
             end += align;
@@ -987,8 +1003,7 @@ impl Pst {
             return false;
         }
         let t = (total - back) as usize;
-        u64le(&buf, t + 8) & !1 == b.bid & !1
-            && crc32(&buf[..b.cb as usize]) == u32le(&buf, t + 4)
+        u64le(&buf, t + 8) & !1 == b.bid & !1 && crc32(&buf[..b.cb as usize]) == u32le(&buf, t + 4)
     }
 
     /// Use a recovered block index instead of the one reached from the header.
@@ -1023,7 +1038,9 @@ impl Pst {
     /// both less code and less to get wrong than building all 564 bytes from the spec.
     pub fn header_bytes(&mut self) -> Result<Vec<u8>, String> {
         let mut h = vec![0u8; HEADER_LEN];
-        self.file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        self.file
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| e.to_string())?;
         self.file.read_exact(&mut h).map_err(|e| e.to_string())?;
         Ok(h)
     }
@@ -1232,7 +1249,11 @@ mod tests {
             for b in &blocks {
                 let _ = pst.block(b.bid);
             }
-            assert!(blocks.len() > 100, "{name}: only {} blocks checked", blocks.len());
+            assert!(
+                blocks.len() > 100,
+                "{name}: only {} blocks checked",
+                blocks.len()
+            );
             assert!(pst.warnings.is_empty(), "{name}: {:?}", pst.warnings);
         }
     }
@@ -1240,43 +1261,63 @@ mod tests {
     /// Carving must find the live blocks without consulting any index at all.
     #[test]
     fn carving_finds_the_blocks_the_index_lists() {
-        let Some(mut pst) = open("dist-list.pst") else { return };
+        let Some(mut pst) = open("dist-list.pst") else {
+            return;
+        };
         let listed: HashSet<u64> = pst.blocks().iter().map(|b| b.bid & !1).collect();
         let carved: HashSet<u64> = pst.carve().iter().map(|b| b.bid & !1).collect();
         let missing: Vec<_> = listed.difference(&carved).collect();
-        assert!(missing.is_empty(), "carving missed {} live blocks: {missing:?}", missing.len());
+        assert!(
+            missing.is_empty(),
+            "carving missed {} live blocks: {missing:?}",
+            missing.len()
+        );
     }
 
     /// The whole point of the project, as a test. A file whose node B-tree root is gone
     /// still gives up every node it had, and each one still points at the same data.
     #[test]
     fn recovers_everything_from_a_destroyed_node_index() {
-        let Some(mut good) = open("dist-list.pst") else { return };
-        let want: BTreeMap<u32, u64> =
-            good.nodes().iter().map(|n| (n.nid, n.bid_data)).collect();
+        let Some(mut good) = open("dist-list.pst") else {
+            return;
+        };
+        let want: BTreeMap<u32, u64> = good.nodes().iter().map(|n| (n.nid, n.bid_data)).collect();
 
         let torn = tear("dist-list.pst", true, false).unwrap();
         let mut pst = Pst::open(&torn).unwrap();
-        assert!(pst.nodes().is_empty(), "the node index survived being zeroed");
+        assert!(
+            pst.nodes().is_empty(),
+            "the node index survived being zeroed"
+        );
 
-        let got: BTreeMap<u32, u64> =
-            pst.scan().nodes.iter().map(|n| (n.nid, n.bid_data)).collect();
-        assert_eq!(got, want, "sweeping did not recover the original node table");
+        let got: BTreeMap<u32, u64> = pst
+            .scan()
+            .nodes
+            .iter()
+            .map(|n| (n.nid, n.bid_data))
+            .collect();
+        assert_eq!(
+            got, want,
+            "sweeping did not recover the original node table"
+        );
     }
 
     /// And with *both* indexes destroyed, carving the blocks out of the file rebuilds
     /// enough to get back to the same answer.
     #[test]
     fn recovers_everything_from_both_indexes_destroyed() {
-        let Some(mut good) = open("dist-list.pst") else { return };
-        let want: BTreeMap<u32, u64> =
-            good.nodes().iter().map(|n| (n.nid, n.bid_data)).collect();
-        let live: BTreeMap<u64, u64> =
-            good.blocks().iter().map(|b| (b.bid & !1, b.ib)).collect();
+        let Some(mut good) = open("dist-list.pst") else {
+            return;
+        };
+        let want: BTreeMap<u32, u64> = good.nodes().iter().map(|n| (n.nid, n.bid_data)).collect();
+        let live: BTreeMap<u64, u64> = good.blocks().iter().map(|b| (b.bid & !1, b.ib)).collect();
 
         let torn = tear("dist-list.pst", true, true).unwrap();
         let mut pst = Pst::open(&torn).unwrap();
-        assert!(pst.nodes().is_empty() && pst.blocks().is_empty(), "an index survived");
+        assert!(
+            pst.nodes().is_empty() && pst.blocks().is_empty(),
+            "an index survived"
+        );
 
         let carved = pst.carve();
         for b in &carved {
@@ -1284,9 +1325,16 @@ mod tests {
                 assert_eq!(b.ib, ib, "carved block {} at the wrong offset", b.bid);
             }
         }
-        let got: BTreeMap<u32, u64> =
-            pst.scan().nodes.iter().map(|n| (n.nid, n.bid_data)).collect();
-        assert_eq!(got, want, "recovery did not reproduce the original node table");
+        let got: BTreeMap<u32, u64> = pst
+            .scan()
+            .nodes
+            .iter()
+            .map(|n| (n.nid, n.bid_data))
+            .collect();
+        assert_eq!(
+            got, want,
+            "recovery did not reproduce the original node table"
+        );
     }
 
     #[test]

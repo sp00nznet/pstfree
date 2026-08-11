@@ -62,7 +62,8 @@ fn random_damage_never_panics_or_hangs() {
         // The other fixture, as a donor for foreign-data damage. It stands in for whatever
         // else the filesystem might have written over this file. Falls back to this file's
         // own bytes when the other fixture was not fetched.
-        let other = std::fs::read(format!("tests/data/{}", FIXTURES[1 - i])).unwrap_or_else(|_| clean.clone());
+        let other = std::fs::read(format!("tests/data/{}", FIXTURES[1 - i]))
+            .unwrap_or_else(|_| clean.clone());
 
         for round in 1..=rounds {
             let mut rng = round.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
@@ -90,7 +91,9 @@ fn random_damage_never_panics_or_hangs() {
                     0 => bytes[at..end].fill(0),
                     // A sector that reads back as noise: absurd lengths and ids, which is
                     // what makes a parser allocate or loop rather than quietly do nothing.
-                    1 => bytes[at..end].iter_mut().for_each(|b| *b = next(&mut rng) as u8),
+                    1 => bytes[at..end]
+                        .iter_mut()
+                        .for_each(|b| *b = next(&mut rng) as u8),
                     // Bit rot. One flipped bit leaves every structure intact and only the
                     // checksums disagreeing, which is the one case the whole verify path
                     // exists for and the one a wipe never produces.

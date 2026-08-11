@@ -187,7 +187,11 @@ fn build_tree(
             .map(|(key, at, page)| {
                 let mut e = vec![0u8; BTENTRY];
                 put64(&mut e, 0, *key);
-                put64(&mut e, 8, u64::from_le_bytes(page[TRAILER_AT + 8..TRAILER_AT + 16].try_into().unwrap()));
+                put64(
+                    &mut e,
+                    8,
+                    u64::from_le_bytes(page[TRAILER_AT + 8..TRAILER_AT + 16].try_into().unwrap()),
+                );
                 put64(&mut e, 16, *at);
                 (*key, e)
             })
@@ -205,12 +209,19 @@ fn build_tree(
 }
 
 /// Copy everything readable into a fresh file with a fresh index.
-pub fn rebuild(pst: &mut Pst, nodes: &[Node], blocks: &[Block], out: &str) -> Result<Rebuilt, String> {
+pub fn rebuild(
+    pst: &mut Pst,
+    nodes: &[Node],
+    blocks: &[Block],
+    out: &str,
+) -> Result<Rebuilt, String> {
     if !pst.is_small_page() {
-        return Err("only the 512-byte-page Unicode PST can be rebuilt so far. An Outlook \
+        return Err(
+            "only the 512-byte-page Unicode PST can be rebuilt so far. An Outlook \
                     2013 OST uses 4K pages and zlib-compressed blocks, and turning one into \
                     a PST is a format conversion rather than a repair — use --export."
-            .into());
+                .into(),
+        );
     }
 
     // Blocks first: a node is only worth keeping if the block holding its data survived.
@@ -223,7 +234,9 @@ pub fn rebuild(pst: &mut Pst, nodes: &[Node], blocks: &[Block], out: &str) -> Re
         }
     }
     if kept.is_empty() {
-        return Err("no block survived well enough to copy — there is nothing to rebuild from".into());
+        return Err(
+            "no block survived well enough to copy — there is nothing to rebuild from".into(),
+        );
     }
     kept.sort_by_key(|(b, _)| b.bid & !1);
 
@@ -295,8 +308,10 @@ pub fn rebuild(pst: &mut Pst, nodes: &[Node], blocks: &[Block], out: &str) -> Re
         })
         .collect();
 
-    let (nbt_bid, nbt_at, nbt_pages) = build_tree(nbt, NBTENTRY, PTYPE_NBT, &mut next, &mut next_bid);
-    let (bbt_bid, bbt_at, bbt_pages) = build_tree(bbt, BBTENTRY, PTYPE_BBT, &mut next, &mut next_bid);
+    let (nbt_bid, nbt_at, nbt_pages) =
+        build_tree(nbt, NBTENTRY, PTYPE_NBT, &mut next, &mut next_bid);
+    let (bbt_bid, bbt_at, bbt_pages) =
+        build_tree(bbt, BBTENTRY, PTYPE_BBT, &mut next, &mut next_bid);
 
     let eof = next.div_ceil(BLOCK_ALIGN) * BLOCK_ALIGN;
     if eof > MAX_REBUILD {
@@ -429,6 +444,9 @@ mod tests {
                 "a block at {at} runs through the map page at {slot}"
             );
         }
-        assert!(!reserved(AMAP_FIRST + PAGE * 3), "ordinary space is not reserved");
+        assert!(
+            !reserved(AMAP_FIRST + PAGE * 3),
+            "ordinary space is not reserved"
+        );
     }
 }

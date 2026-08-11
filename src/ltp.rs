@@ -233,8 +233,14 @@ const PID_NAMEID_STRINGS: u16 = 0x0004;
 /// tells them they are looking at a calendar item's own fields. The rest print as GUIDs.
 const WELL_KNOWN: [(&str, &str); 9] = [
     ("PS_MAPI", "{00020328-0000-0000-C000-000000000046}"),
-    ("PS_PUBLIC_STRINGS", "{00020329-0000-0000-C000-000000000046}"),
-    ("PSETID_Appointment", "{00062002-0000-0000-C000-000000000046}"),
+    (
+        "PS_PUBLIC_STRINGS",
+        "{00020329-0000-0000-C000-000000000046}",
+    ),
+    (
+        "PSETID_Appointment",
+        "{00062002-0000-0000-C000-000000000046}",
+    ),
     ("PSETID_Task", "{00062003-0000-0000-C000-000000000046}"),
     ("PSETID_Address", "{00062004-0000-0000-C000-000000000046}"),
     ("PSETID_Common", "{00062008-0000-0000-C000-000000000046}"),
@@ -272,7 +278,10 @@ fn guid_str(b: &[u8]) -> String {
         u16::from_le_bytes(b[6..8].try_into().unwrap()),
         b[8],
         b[9],
-        b[10..16].iter().map(|x| format!("{x:02X}")).collect::<String>()
+        b[10..16]
+            .iter()
+            .map(|x| format!("{x:02X}"))
+            .collect::<String>()
     );
     match WELL_KNOWN.iter().find(|(_, g)| *g == s) {
         Some((name, _)) => (*name).to_string(),
@@ -335,7 +344,8 @@ pub fn read_names(pst: &mut Pst, nodes: &[Node]) -> Names {
             };
             match strings.get(at + 4..at + 4 + len) {
                 Some(s) => {
-                    let u: Vec<u16> = s.chunks_exact(2)
+                    let u: Vec<u16> = s
+                        .chunks_exact(2)
                         .map(|c| u16::from_le_bytes([c[0], c[1]]))
                         .collect();
                     format!("\"{}\"", String::from_utf16_lossy(&u))
@@ -348,7 +358,11 @@ pub fn read_names(pst: &mut Pst, nodes: &[Node]) -> Names {
 
         out.insert(
             id as u16,
-            if set.is_empty() { name } else { format!("{set} {name}") },
+            if set.is_empty() {
+                name
+            } else {
+                format!("{set} {name}")
+            },
         );
     }
     Names(out)
@@ -622,7 +636,10 @@ pub fn read_tc(pst: &mut Pst, bid_data: u64, bid_sub: u64) -> Result<Tc, String>
     }
     let info = heap.item(heap.user_root)?;
     if info.len() < 22 {
-        return Err(format!("table header is {} bytes, expected at least 22", info.len()));
+        return Err(format!(
+            "table header is {} bytes, expected at least 22",
+            info.len()
+        ));
     }
     if info[0] != TC_SIGNATURE {
         return Err(format!(
@@ -637,10 +654,14 @@ pub fn read_tc(pst: &mut Pst, bid_data: u64, bid_sub: u64) -> Result<Tc, String>
     let width = u16le(info, 8) as usize;
     let hnid_rows = u32le(info, 14);
     if info.len() < 22 + ncols * 8 {
-        return Err(format!("table declares {ncols} columns that do not fit its header"));
+        return Err(format!(
+            "table declares {ncols} columns that do not fit its header"
+        ));
     }
     if width == 0 || ceb_start > width {
-        return Err(format!("table rows are {width} bytes with a bitmap at {ceb_start}"));
+        return Err(format!(
+            "table rows are {width} bytes with a bitmap at {ceb_start}"
+        ));
     }
 
     let mut columns = Vec::with_capacity(ncols);
@@ -664,7 +685,11 @@ pub fn read_tc(pst: &mut Pst, bid_data: u64, bid_sub: u64) -> Result<Tc, String>
     } else {
         match pst.subnodes(bid_sub)?.get(&hnid_rows).copied() {
             Some(s) => pst.node_blocks(s.data)?,
-            None => return Err(format!("table rows are in subnode 0x{hnid_rows:08X}, which is not there")),
+            None => {
+                return Err(format!(
+                    "table rows are in subnode 0x{hnid_rows:08X}, which is not there"
+                ))
+            }
         }
     };
 
@@ -709,7 +734,10 @@ pub fn read_tc(pst: &mut Pst, bid_data: u64, bid_sub: u64) -> Result<Tc, String>
                 };
                 props.insert(c.prop, v);
             }
-            rows.push(Row { id: u32le(r, 0), props });
+            rows.push(Row {
+                id: u32le(r, 0),
+                props,
+            });
         }
     }
     Ok(Tc { rows })
@@ -728,7 +756,9 @@ pub struct Recipient {
 /// This is what the display-name properties cannot give: `PidTagDisplayTo` holds the
 /// names Outlook showed, whereas this holds the addresses mail was actually sent to.
 pub fn read_recipients(pst: &mut Pst, bid_sub: u64) -> Vec<Recipient> {
-    let Ok(subs) = pst.subnodes(bid_sub) else { return Vec::new() };
+    let Ok(subs) = pst.subnodes(bid_sub) else {
+        return Vec::new();
+    };
     let Some((_, sub)) = subs
         .iter()
         .find(|(nid, _)| *nid & 0x1F == NID_TYPE_RECIPIENT_TABLE)
@@ -736,7 +766,9 @@ pub fn read_recipients(pst: &mut Pst, bid_sub: u64) -> Vec<Recipient> {
     else {
         return Vec::new();
     };
-    let Ok(tc) = read_tc(pst, sub.data, sub.sub) else { return Vec::new() };
+    let Ok(tc) = read_tc(pst, sub.data, sub.sub) else {
+        return Vec::new();
+    };
 
     tc.rows
         .iter()
@@ -772,7 +804,10 @@ fn decode_inline(ptype: u16, b: &[u8]) -> Value {
         0x0005 | 0x0007 => Value::Float(f64::from_bits(n(8).unwrap_or(0))),
         0x0006 | 0x0014 => Value::Int(n(8).unwrap_or(0) as i64),
         0x0040 => Value::Time(n(8).unwrap_or(0)),
-        _ => Value::Raw { ptype, bytes: b.to_vec() },
+        _ => Value::Raw {
+            ptype,
+            bytes: b.to_vec(),
+        },
     }
 }
 
@@ -832,7 +867,9 @@ mod tests {
     /// entry would still print something perfectly plausible and would not survive that.
     #[test]
     fn named_properties_resolve_to_what_they_actually_are() {
-        let Some(mut pst) = fixture("dist-list.pst") else { return };
+        let Some(mut pst) = fixture("dist-list.pst") else {
+            return;
+        };
         let nodes = pst.nodes();
         let names = read_names(&mut pst, &nodes);
 
@@ -844,7 +881,10 @@ mod tests {
         assert_eq!(names.get(0x8004), Some("PSETID_Appointment 0x820D"));
         assert_eq!(names.get(0x8005), Some("PSETID_Appointment 0x820E"));
 
-        let appt = *nodes.iter().find(|n| n.nid == 0x2000C4).expect("the appointment");
+        let appt = *nodes
+            .iter()
+            .find(|n| n.nid == 0x2000C4)
+            .expect("the appointment");
         let pc = read_node_pc(&mut pst, &appt).expect("appointment should read");
         assert!(
             matches!(pc.props.get(&0x8004), Some(Value::Time(_))),
@@ -1022,7 +1062,9 @@ mod tests {
             let mut checked = 0;
             for f in nodes.iter().filter(|n| n.nid_type() == 0x02) {
                 let table_nid = (f.nid & !0x1F) | NID_TYPE_HIERARCHY_TABLE;
-                let Some(t) = by_nid.get(&table_nid) else { continue };
+                let Some(t) = by_nid.get(&table_nid) else {
+                    continue;
+                };
                 let tc = read_tc(&mut pst, t.bid_data, t.bid_sub)
                     .unwrap_or_else(|e| panic!("{file} hierarchy table 0x{table_nid:X}: {e}"));
 
@@ -1064,14 +1106,19 @@ mod tests {
 
         for f in nodes.iter().filter(|n| n.nid_type() == 0x02) {
             let table_nid = (f.nid & !0x1F) | NID_TYPE_CONTENTS_TABLE;
-            let Some(t) = by_nid.get(&table_nid) else { continue };
+            let Some(t) = by_nid.get(&table_nid) else {
+                continue;
+            };
             let tc = read_tc(&mut pst, t.bid_data, t.bid_sub).unwrap();
             for r in &tc.rows {
                 listed.insert(r.id);
             }
         }
-        let real: BTreeSet<u32> =
-            nodes.iter().filter(|n| n.nid_type() == 0x04).map(|n| n.nid).collect();
+        let real: BTreeSet<u32> = nodes
+            .iter()
+            .filter(|n| n.nid_type() == 0x04)
+            .map(|n| n.nid)
+            .collect();
         assert_eq!(listed, real, "contents tables and the node list disagree");
     }
 

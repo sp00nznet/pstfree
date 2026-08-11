@@ -72,7 +72,11 @@ pub fn build(children: Vec<Item>) -> Vec<u8> {
             mini_stream.extend_from_slice(&bytes);
             mini_stream.resize(mini_stream.len().next_multiple_of(MINI_SECTOR), 0);
             for i in 0..count {
-                minifat.push(if i + 1 == count { ENDOFCHAIN } else { first + i as u32 + 1 });
+                minifat.push(if i + 1 == count {
+                    ENDOFCHAIN
+                } else {
+                    first + i as u32 + 1
+                });
             }
             dirs[idx].start = first;
             dirs[idx].size = bytes.len() as u64;
@@ -121,7 +125,9 @@ pub fn build(children: Vec<Item>) -> Vec<u8> {
     loop {
         let total = fat.len() + n_fat + n_difat;
         let need_fat = total.div_ceil(SECTOR / 4).max(1);
-        let need_difat = need_fat.saturating_sub(DIFAT_IN_HEADER).div_ceil(SECTOR / 4 - 1);
+        let need_difat = need_fat
+            .saturating_sub(DIFAT_IN_HEADER)
+            .div_ceil(SECTOR / 4 - 1);
         if need_fat == n_fat && need_difat == n_difat {
             break;
         }
@@ -129,13 +135,9 @@ pub fn build(children: Vec<Item>) -> Vec<u8> {
     }
 
     let fat_start = fat.len() as u32;
-    for _ in 0..n_fat {
-        fat.push(FATSECT);
-    }
+    fat.resize(fat.len() + n_fat, FATSECT);
     let difat_start = fat.len() as u32;
-    for _ in 0..n_difat {
-        fat.push(DIFSECT);
-    }
+    fat.resize(fat.len() + n_difat, DIFSECT);
     fat.resize(n_fat * (SECTOR / 4), FREESECT);
 
     let mut fatbytes = Vec::new();
@@ -149,14 +151,21 @@ pub fn build(children: Vec<Item>) -> Vec<u8> {
     let fat_ids: Vec<u32> = (0..n_fat as u32).map(|i| fat_start + i).collect();
     let mut difat_bytes = Vec::new();
     let per = SECTOR / 4 - 1;
-    for (i, part) in fat_ids[DIFAT_IN_HEADER.min(fat_ids.len())..].chunks(per).enumerate() {
+    for (i, part) in fat_ids[DIFAT_IN_HEADER.min(fat_ids.len())..]
+        .chunks(per)
+        .enumerate()
+    {
         for v in part {
             difat_bytes.extend_from_slice(&v.to_le_bytes());
         }
         for _ in part.len()..per {
             difat_bytes.extend_from_slice(&FREESECT.to_le_bytes());
         }
-        let next = if i + 1 < n_difat { difat_start + i as u32 + 1 } else { ENDOFCHAIN };
+        let next = if i + 1 < n_difat {
+            difat_start + i as u32 + 1
+        } else {
+            ENDOFCHAIN
+        };
         difat_bytes.extend_from_slice(&next.to_le_bytes());
     }
     data.extend_from_slice(&difat_bytes);
@@ -179,7 +188,11 @@ fn chain(data: &mut Vec<u8>, fat: &mut Vec<u32>, bytes: &[u8]) -> u32 {
     let first = fat.len() as u32;
     let count = bytes.len().div_ceil(SECTOR);
     for i in 0..count {
-        fat.push(if i + 1 == count { ENDOFCHAIN } else { first + i as u32 + 1 });
+        fat.push(if i + 1 == count {
+            ENDOFCHAIN
+        } else {
+            first + i as u32 + 1
+        });
     }
     data.extend_from_slice(bytes);
     data.resize(data.len().next_multiple_of(SECTOR), 0);
@@ -302,7 +315,11 @@ mod tests {
     /// writer knows. If the two agree, the writer is producing a real compound file and
     /// not just something its own code understands.
     fn read_back(buf: &[u8]) -> BTreeMap<String, Vec<u8>> {
-        assert_eq!(&buf[0..8], &[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1], "bad signature");
+        assert_eq!(
+            &buf[0..8],
+            &[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1],
+            "bad signature"
+        );
         let u32at = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
         let sector = |n: u32| -> &[u8] {
             let s = SECTOR + n as usize * SECTOR;
@@ -344,14 +361,13 @@ mod tests {
 
         let dir = follow(u32at(48), &fat);
         let minifat_raw = follow(u32at(60), &fat);
-        let minifat: Vec<u32> =
-            minifat_raw.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let minifat: Vec<u32> = minifat_raw
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
 
         // The root entry's own stream is the mini stream.
-        let mini = follow(
-            u32::from_le_bytes(dir[116..120].try_into().unwrap()),
-            &fat,
-        );
+        let mini = follow(u32::from_le_bytes(dir[116..120].try_into().unwrap()), &fat);
 
         let mut out = BTreeMap::new();
         for e in dir.chunks_exact(128) {
@@ -393,14 +409,27 @@ mod tests {
             Item::Stream("__substg1.0_0037001F".into(), b"hello".to_vec()),
             Item::Storage(
                 "__recip_version1.0_#00000000".into(),
-                vec![Item::Stream("__substg1.0_3001001F".into(), b"someone".to_vec())],
+                vec![Item::Stream(
+                    "__substg1.0_3001001F".into(),
+                    b"someone".to_vec(),
+                )],
             ),
         ]);
-        assert_eq!(file.len() % SECTOR, 0, "file is not a whole number of sectors");
+        assert_eq!(
+            file.len() % SECTOR,
+            0,
+            "file is not a whole number of sectors"
+        );
 
         let got = read_back(&file);
-        assert_eq!(got.get("__substg1.0_0037001F").map(|v| v.as_slice()), Some(&b"hello"[..]));
-        assert_eq!(got.get("__substg1.0_3001001F").map(|v| v.as_slice()), Some(&b"someone"[..]));
+        assert_eq!(
+            got.get("__substg1.0_0037001F").map(|v| v.as_slice()),
+            Some(&b"hello"[..])
+        );
+        assert_eq!(
+            got.get("__substg1.0_3001001F").map(|v| v.as_slice()),
+            Some(&b"someone"[..])
+        );
         assert_eq!(got.get("__properties_version1.0"), Some(&vec![7u8; 40]));
     }
 
@@ -414,7 +443,11 @@ mod tests {
             Item::Stream("tiny".into(), b"x".to_vec()),
         ]);
         let got = read_back(&file);
-        assert_eq!(got.get("__substg1.0_37010102"), Some(&big), "big stream did not survive");
+        assert_eq!(
+            got.get("__substg1.0_37010102"),
+            Some(&big),
+            "big stream did not survive"
+        );
         assert_eq!(got.get("tiny").map(|v| v.as_slice()), Some(&b"x"[..]));
     }
 
