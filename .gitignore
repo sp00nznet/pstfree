@@ -1,4 +1,10 @@
 target/
+
+# Real PSTs contain real mail. Nothing that came out of one belongs in this repo, and
+# extensions alone are not enough of a guard: the bake-off once wrote files named
+# "dist-list.pst__intact_", which every rule below except the directories missed.
+tests/data/
+tests/cases/
 *.pst
 *.ost
 *.eml
