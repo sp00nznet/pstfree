@@ -328,7 +328,8 @@ index that pointed at it is caught rather than parsed.
 
 ## Scope
 
-**Reading** — Unicode and ANSI PST, and OST. Folder tree, messages, properties,
+**Reading** — Unicode PST and OST. ANSI PST (Outlook 97–2002) is refused rather than
+half-parsed, and stays that way until a sample turns up. Folder tree, messages, properties,
 attachments, embedded messages, plain/HTML/compressed-RTF bodies, calendar and contacts.
 Password ignored, because there is nothing there to ignore.
 
@@ -382,10 +383,16 @@ promised.
   would be OST-only. Currently labelled as undocumented rather than guessed at.
 - **Encrypted OST.** Per MS-PST the encoding modes are keyless, but Microsoft 365 profiles
   can restrict a local cache in ways this repo hasn't tested. Needs a real sample.
-- **Recovery has only ever been tested against damage this repo inflicted itself.** Zeroed
-  root pages and a truncated tail are realistic failures, but they are clean ones. Files
-  ruined by a failing disk, a half-finished write or a bad network share fail in messier
-  ways, and none of those have been tried.
+- **Recovery has only ever been tested against damage this repo inflicted itself.** There
+  is no public corpus of broken PSTs to test against — the EDRM Enron PST sets are all
+  dead links now, the Digital Corpora forensic scenarios turn out to contain no PST or OST
+  at all, and no PST library ships a fixture. So the damage is still self-inflicted, but
+  it is no longer only the tidy kind: `tests/fuzz.rs` splats runs of zeroes and junk over
+  random offsets, half of them biased into the first 16KB where the structural fields
+  live, and checks that reading, sweeping and carving neither panic nor hang. 1600
+  mangled files so far, none of them able to break it. What that does *not* prove is that
+  recovery returns the right answer on real-world damage, and no amount of random
+  splatter will. Set `PSTFREE_FUZZ_ROUNDS` to hunt harder; failing rounds keep their file.
 - **A node whose every surviving index entry is stale recovers as an older revision.**
   Nothing can be done about that — the newer entry is genuinely not in the file any more —
   but the recovery does not currently say which nodes those were, and it should.
@@ -448,7 +455,7 @@ Updated as things land. Nothing is claimed here until it runs.
 | 4c | Export to `.mbox` and `.msg` | ✅ done |
 | 8 | The window | ✅ done |
 
-38 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
+39 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
 the public fixtures from freepst, fetched by `tests\fetch-fixtures.ps1`. Test files are
 not committed, because real PSTs contain real mail; the tests skip rather than fail when
 they are absent.
