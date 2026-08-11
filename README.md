@@ -387,12 +387,28 @@ promised.
   is no public corpus of broken PSTs to test against — the EDRM Enron PST sets are all
   dead links now, the Digital Corpora forensic scenarios turn out to contain no PST or OST
   at all, and no PST library ships a fixture. So the damage is still self-inflicted, but
-  it is no longer only the tidy kind: `tests/fuzz.rs` splats runs of zeroes and junk over
-  random offsets, half of them biased into the first 16KB where the structural fields
-  live, and checks that reading, sweeping and carving neither panic nor hang. 1600
-  mangled files so far, none of them able to break it. What that does *not* prove is that
-  recovery returns the right answer on real-world damage, and no amount of random
-  splatter will. Set `PSTFREE_FUZZ_ROUNDS` to hunt harder; failing rounds keep their file.
+  it is no longer only the tidy kind. `tests/fuzz.rs` mangles the real fixtures in the
+  five shapes real storage fails in, all sector-aligned because a disk does not fail at
+  byte granularity: a wiped run, a junk run, a single flipped bit, sectors *transplanted
+  from elsewhere in the same file*, and sectors of a *different file* entirely. Half the
+  damage is aimed at the first 16KB, where the fields a parser trusts live — a wrecked
+  mail body is a wrong subject line, a wrecked count is something to loop on. Each result
+  is read, swept and carved under a panic guard and a timeout.
+
+  The last two shapes are the interesting ones, and they are why this is a fuzzer and not
+  a disk image. Putting the file on a virtual disk and corrupting *that* mostly tests
+  NTFS; the one thing it produces that matters is a file with foreign clusters spliced
+  into it, and those bytes can be synthesized directly in five lines. A transplanted
+  sector is real structure with a real checksum sitting where it does not belong — which
+  is the shape of the stale-revision and ghost-block problem, and nothing a wipe can make.
+
+  It found one: `walk` checked that a page's declared entries *fit* in the page but never
+  that `cbEnt` was big enough for the entry it described, so a page claiming 8-byte
+  entries panicked every reader that indexed past offset 8. It is a diagnosis now, and
+  4000 mangled files since have produced no panic and no hang.
+  What none of this proves is that recovery returns the *right answer* on real-world
+  damage. No amount of random splatter will. Set `PSTFREE_FUZZ_ROUNDS` to hunt harder;
+  a failing round keeps its file on disk and its seed replays it exactly.
 - **A node whose every surviving index entry is stale recovers as an older revision.**
   Nothing can be done about that — the newer entry is genuinely not in the file any more —
   but the recovery does not currently say which nodes those were, and it should.

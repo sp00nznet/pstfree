@@ -15,6 +15,9 @@ use pstfree::ndb::Pst;
 use std::sync::mpsc;
 use std::time::Duration;
 
+/// Damage is aligned and sized in these, because that is the unit a disk fails in.
+const SECTOR: usize = 512;
+
 /// xorshift64*, four lines and no dependency, seeded per round so any failure replays.
 fn next(state: &mut u64) -> u64 {
     *state ^= *state >> 12;
@@ -47,24 +50,28 @@ fn random_damage_never_panics_or_hangs() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(8);
 
-    for name in ["dist-list.pst", "example-2013.ost"] {
+    const FIXTURES: [&str; 2] = ["dist-list.pst", "example-2013.ost"];
+
+    for (i, name) in FIXTURES.iter().enumerate() {
         let src = format!("tests/data/{name}");
         if !std::path::Path::new(&src).exists() {
             eprintln!("skipping {name}: run tests/fetch-fixtures.ps1");
             continue;
         }
         let clean = std::fs::read(&src).unwrap();
+        // The other fixture, as a donor for foreign-data damage. It stands in for whatever
+        // else the filesystem might have written over this file. Falls back to this file's
+        // own bytes when the other fixture was not fetched.
+        let other = std::fs::read(format!("tests/data/{}", FIXTURES[1 - i])).unwrap_or_else(|_| clean.clone());
 
         for round in 1..=rounds {
             let mut rng = round.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
             let mut bytes = clean.clone();
 
-            // A handful of runs rather than scattered single bytes: a bad sector, a torn
-            // write or a partial overwrite all lose a contiguous stretch, not a byte here
-            // and there. Half are zeroed and half filled with junk, because a run of
-            // zeroes reads as a plausible-but-empty structure while junk reads as absurd
-            // lengths, and those break parsers differently.
             for _ in 0..1 + next(&mut rng) % 8 {
+                // Sector-aligned, because a disk does not fail at byte granularity: a bad
+                // sector loses all 512 bytes of itself and none of its neighbour's.
+                //
                 // Half the runs land in the first 16KB. Uniform offsets almost never hit
                 // it, and that is where every field a parser trusts lives — the header,
                 // the B-tree roots, the first index pages. Damage to a mail body is a
@@ -74,11 +81,41 @@ fn random_damage_never_panics_or_hangs() {
                 } else {
                     bytes.len()
                 };
-                let at = next(&mut rng) as usize % reach;
-                let end = (at + 1 + next(&mut rng) as usize % 512).min(bytes.len());
-                let zeroed = next(&mut rng) & 1 == 0;
-                for b in &mut bytes[at..end] {
-                    *b = if zeroed { 0 } else { next(&mut rng) as u8 };
+                let at = (next(&mut rng) as usize % reach) / SECTOR * SECTOR;
+                let end = (at + (1 + next(&mut rng) as usize % 8) * SECTOR).min(bytes.len());
+
+                match next(&mut rng) % 5 {
+                    // A sector that reads back as zeroes: plausible-but-empty structure,
+                    // counts of nothing, offsets to the front of the file.
+                    0 => bytes[at..end].fill(0),
+                    // A sector that reads back as noise: absurd lengths and ids, which is
+                    // what makes a parser allocate or loop rather than quietly do nothing.
+                    1 => bytes[at..end].iter_mut().for_each(|b| *b = next(&mut rng) as u8),
+                    // Bit rot. One flipped bit leaves every structure intact and only the
+                    // checksums disagreeing, which is the one case the whole verify path
+                    // exists for and the one a wipe never produces.
+                    2 => {
+                        let i = at + next(&mut rng) as usize % (end - at);
+                        bytes[i] ^= 1 << (next(&mut rng) % 8);
+                    }
+                    // A torn write, and the reason the image idea was tempting: sectors
+                    // from elsewhere in this same file land here. The bytes are a real
+                    // page with a real checksum, just the wrong one — so nothing looks
+                    // damaged, it looks like a different node than it is. This is the
+                    // shape of the stale-revision and ghost-block problem.
+                    3 => {
+                        let from = (next(&mut rng) as usize % bytes.len()) / SECTOR * SECTOR;
+                        let n = (end - at).min(bytes.len() - from);
+                        bytes.copy_within(from..from + n, at);
+                    }
+                    // Foreign data: the filesystem gave this space to another file. The
+                    // other fixture is the honest source, since carving must not mistake
+                    // an OST's blocks for this file's own.
+                    _ => {
+                        let n = (end - at).min(other.len());
+                        let from = next(&mut rng) as usize % (other.len() - n + 1);
+                        bytes[at..at + n].copy_from_slice(&other[from..from + n]);
+                    }
                 }
             }
 

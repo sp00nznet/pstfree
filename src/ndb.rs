@@ -485,7 +485,26 @@ impl Pst {
         } else {
             (page[f] as usize, page[f + 2] as usize, page[f + 3])
         };
-        if size == 0 || count * size > f {
+        // cbEnt is a number off the page, so it cannot be trusted to be big enough for the
+        // entry it claims to describe. Every reader below indexes at a fixed offset — a
+        // BTENTRY's BREF ends at 24, an NBTENTRY's nidParent at 28, a BBTENTRY's cRef at
+        // 20 — so a short slice runs off the end of itself. On a damaged file that is a
+        // panic instead of a diagnosis, which is the one outcome this tool cannot have.
+        let need = if level > 0 {
+            24
+        } else if want == PTYPE_NBT {
+            28
+        } else {
+            20
+        };
+        if size < need {
+            self.warnings.push(format!(
+                "page at {} declares {size}-byte entries, too small for the {need} bytes one holds — skipped",
+                at.ib
+            ));
+            return;
+        }
+        if count * size > f {
             self.warnings.push(format!(
                 "page at {} declares {count} entries of {size} bytes, which does not fit — skipped",
                 at.ib
