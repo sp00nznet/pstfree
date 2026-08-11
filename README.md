@@ -364,12 +364,17 @@ promised.
   against the format and independently by 7-Zip, and the property streams follow MS-OXMSG
   — but "a valid compound file with the right streams in it" is not the same claim as
   "Outlook opens it", and only the first has been tested.
-- **`PidTagBody` (`0x1000`) is absent from all three fixtures.** The HTML body
-  (`PidTagHtml`, `0x1013`) is there and correct — it scales with the message, 114 bytes
-  for a short one and 5816 for a long one. But the plain-text body turns up under
-  `0x6619`, which MS-OXPROPS assigns to something else entirely. Property ids either side
-  of it decode correctly, so this is not a misaligned read; these files genuinely put it
-  there. Export needs this settled, and it wants more than three sample files first.
+- ~~**`PidTagBody` (`0x1000`) is absent from all three fixtures.**~~ **Settled, and the
+  original reading was wrong.** `0x1000` is not absent; it is present on every message
+  that actually has a plain-text body, and holds exactly the right text. The earlier
+  conclusion came from messages that have no plain-text body at all — a distribution
+  list, a contact and a free/busy record, none of which are mail. Nor is `0x1013` "the
+  HTML body, there and correct": on the OST it holds 114 bytes of plain text with not one
+  `<` in it. And `0x6619` is not where the plain text lives — it appears only alongside
+  a body that is already in `0x1000` or `0x1013`, carrying the same text again as UTF-16.
+  libpff reads all of this identically, so it is what Outlook wrote rather than a
+  misparse. Export was already using `0x1000` and `0x1013`, so the only thing to fix was
+  the typing (below).
 - **Named properties (`0x8000` and up) are shown by number, not by name.** Resolving them
   means reading the name-to-id map in node `0x61`. They are visible and intact in
   `--props`; they just have no labels yet.
@@ -430,12 +435,16 @@ builds the same damaged files for both and asks each one how much mail it can ge
 | Case | libpff | pstfree |
 |---|---|---|
 | all three fixtures, intact | reads, 4 / 3 / 3 messages | **identical, 4 / 3 / 3** |
+| every property of every message | 10 messages, 686 properties | **identical, id for id** |
 | B-tree roots zeroed | refuses to open | reads all of them |
 | truncated to 60% | reads | reads |
 | 20 junk sectors | refuses to open, or `OSError` | reads all of them |
 
-Exact agreement on every undamaged file, which is the part that matters most — a repair
-tool that quietly disagrees with the reference on healthy input is not a repair tool. On
+Exact agreement on every undamaged file, and not only on the message count: every
+property of every message, 686 of them, id for id, with nothing either tool sees that the
+other misses. That is the part that matters most — a repair tool that quietly disagrees
+with the reference on healthy input is not a repair tool. It also earned its keep
+immediately, catching a body exported as `text/html` that had no markup in it. On
 the six damaged files libpff opened none and this opened all six, which is the pitch, now
 measured rather than asserted. On the OST with its roots zeroed the sweep returns **seven**
 messages where the intact file has three: the extra four are deleted mail whose index
@@ -507,7 +516,7 @@ Updated as things land. Nothing is claimed here until it runs.
 | 4c | Export to `.mbox` and `.msg` | ✅ done |
 | 8 | The window | ✅ done |
 
-40 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
+41 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
 the public fixtures from freepst, fetched by `tests\fetch-fixtures.ps1`. Test files are
 not committed, because real PSTs contain real mail; the tests skip rather than fail when
 they are absent.

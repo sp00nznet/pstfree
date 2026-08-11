@@ -95,6 +95,56 @@ def ask_pstfree(path):
     return "no messages", 0
 
 
+def compare_properties():
+    """Every property of every message, both tools, and where they disagree.
+
+    Counting messages only proves the folders were walked. This goes a level down and
+    asks whether the two read the same properties off the same node, which is where a
+    silent misparse would actually show up.
+    """
+    import pypff
+
+    print("\nproperties, per message\n")
+    for name in ("dist-list.pst", "example-2013.ost", "passworded.pst"):
+        path = os.path.join(REPO, "tests", "data", name)
+        if not os.path.exists(path):
+            continue
+        f = pypff.file()
+        f.open(path)
+
+        def walk(folder, out):
+            for i in range(folder.get_number_of_sub_messages()):
+                out.append(folder.get_sub_message(i))
+            for i in range(folder.get_number_of_sub_folders()):
+                walk(folder.get_sub_folder(i), out)
+            return out
+
+        checked, props, differed = 0, 0, []
+        for m in walk(f.get_root_folder(), []):
+            nid = m.get_identifier()
+            theirs = set()
+            for i in range(m.number_of_record_sets):
+                rs = m.get_record_set(i)
+                for j in range(rs.number_of_entries):
+                    theirs.add(rs.get_entry(j).entry_type)
+
+            p = subprocess.run([PSTFREE, path, "--props", f"{nid:X}"],
+                               capture_output=True, text=True, timeout=120)
+            ours = {int(x, 16) for x in re.findall(r"^\s+0x([0-9A-F]{4})\s", p.stdout, re.M)}
+
+            checked += 1
+            props += len(theirs)
+            if theirs != ours:
+                differed.append((nid, sorted(theirs - ours), sorted(ours - theirs)))
+        f.close()
+
+        print(f"  {name}: {checked} message(s), {props} properties, "
+              f"{len(differed)} disagreeing")
+        for nid, missing, extra in differed:
+            print(f"    0x{nid:X}  libpff only: {[hex(x) for x in missing]}"
+                  f"  pstfree only: {[hex(x) for x in extra]}")
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     rows = []
@@ -113,6 +163,8 @@ def main():
     print("-" * (w + 60))
     for label, ls, ln, ps, pn in rows:
         print(f"{label.ljust(w)} | {ls:<22} {ln:>5} | {ps:<16} {pn:>5}")
+
+    compare_properties()
 
 
 if __name__ == "__main__":

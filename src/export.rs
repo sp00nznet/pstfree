@@ -339,7 +339,12 @@ pub fn build_eml(pc: &Pc, attachments: &[Attachment], recipients: &[Recipient]) 
         parts.push((format!("text/plain; charset={cs}"), b));
     }
     if let Some((b, cs)) = html {
-        parts.push((format!("text/html; charset={cs}"), b));
+        // PidTagHtml does not always hold HTML. Outlook's own account-test message puts a
+        // plain-text body in it, and declaring that text/html makes a reader fold the
+        // blank lines away — the only structure a plain-text body has. Nothing without a
+        // single `<` anywhere in it is markup, whichever property it arrived in.
+        let kind = if b.contains(&b'<') { "text/html" } else { "text/plain" };
+        parts.push((format!("{kind}; charset={cs}"), b));
     }
 
     out.push_str("MIME-Version: 1.0\r\n");
@@ -792,6 +797,26 @@ mod tests {
         // aGVsbG8= is "hello". The attachment bytes must actually be in there.
         assert!(mixed.contains("aGVsbG8="), "attachment payload missing");
         assert!(mixed.trim_end().ends_with("--"), "multipart is not closed");
+    }
+
+    /// A body is typed by what it contains, not by the property it arrived in.
+    ///
+    /// The 2013 OST fixture stores its message body in `PidTagHtml` with no markup in it
+    /// at all — libpff reads the same bytes, so this is what Outlook wrote, not a
+    /// misread. Sending that out as `text/html` costs the reader every line break in it.
+    #[test]
+    fn a_body_with_no_markup_is_not_html_whatever_property_it_came_from() {
+        let plain = pc_with(&[(
+            PID_BODY_HTML,
+            Value::Bytes(b"Line one.\r\n\r\nLine two.\r\n".to_vec()),
+        )]);
+        let out = String::from_utf8(build_eml(&plain, &[], &[])).unwrap();
+        assert!(out.contains("text/plain"), "no-markup body typed as HTML:\n{out}");
+        assert!(!out.contains("text/html"), "{out}");
+
+        let markup = pc_with(&[(PID_BODY_HTML, Value::Bytes(b"<p>rich</p>".to_vec()))]);
+        let out = String::from_utf8(build_eml(&markup, &[], &[])).unwrap();
+        assert!(out.contains("text/html"), "real markup must stay HTML:\n{out}");
     }
 
     /// A line beginning `From ` inside a message would look like the start of the next
