@@ -409,12 +409,48 @@ promised.
   What none of this proves is that recovery returns the *right answer* on real-world
   damage. No amount of random splatter will. Set `PSTFREE_FUZZ_ROUNDS` to hunt harder;
   a failing round keeps its file on disk and its seed replays it exactly.
-- **A node whose every surviving index entry is stale recovers as an older revision.**
-  Nothing can be done about that — the newer entry is genuinely not in the file any more —
-  but the recovery does not currently say which nodes those were, and it should.
+- **A node whose every surviving index entry is stale still recovers as an older
+  revision** — nothing can be done about that, the newer entry is genuinely not in the
+  file any more. It is named now rather than passed off silently: a sweep that had to
+  choose between disagreeing copies of a node's entry lists the nodes it chose for, and
+  says which ones point at data that is no longer in the file at all. A node id can be
+  taken to `--props` and the message read; "some of your mail may be an old copy" is not
+  something anyone can act on. The warning is printed only when the sweep *is* the index.
+  While the file's own index is readable it settles all of this, and warning then would
+  be crying wolf over a healthy file.
+
+### Measured against libpff
+
+[libpff] is the reference implementation nearly every other PST tool wraps, and it is the
+honest yardstick: where it reads a file and this does not, this is wrong. `tests/bakeoff.py`
+builds the same damaged files for both and asks each one how much mail it can get out
+(`pip install libpff-python` first — a Python dependency has no business gating
+`cargo test`, so it is a script rather than a test).
+
+| Case | libpff | pstfree |
+|---|---|---|
+| all three fixtures, intact | reads, 4 / 3 / 3 messages | **identical, 4 / 3 / 3** |
+| B-tree roots zeroed | refuses to open | reads all of them |
+| truncated to 60% | reads | reads |
+| 20 junk sectors | refuses to open, or `OSError` | reads all of them |
+
+Exact agreement on every undamaged file, which is the part that matters most — a repair
+tool that quietly disagrees with the reference on healthy input is not a repair tool. On
+the six damaged files libpff opened none and this opened all six, which is the pitch, now
+measured rather than asserted. On the OST with its roots zeroed the sweep returns **seven**
+messages where the intact file has three: the extra four are deleted mail whose index
+entries were dropped and whose freed pages still hold them.
 
 ### Resolved along the way
 
+- **The sweep can be checked against ground truth, and it was wrong.** An undamaged file
+  carries both the authoritative index *and* the freed pages the sweep reads, so the sweep
+  can be run where the right answer is already known. Doing that found a real fault: with
+  the tie between disagreeing copies broken on the data block alone, one node in
+  `dist-list.pst` came back carrying an older subnode tree — a message whose attachments
+  had moved but whose body had not. Breaking the tie on `bid_sub` as well fixed it, and
+  all three fixtures now reproduce their own index exactly, node for node. It is a test
+  now, and it is the only real evidence recovery has.
 - **The checksum is ordinary CRC-32 and did not need transcribing at all.** MS-PST 5.3
   presents it as slicing-by-8 across eight 256-entry tables — eight kilobytes of constants.
   But the first of those tables is the standard CRC-32 table (polynomial `0xEDB88320`), and
@@ -471,7 +507,7 @@ Updated as things land. Nothing is claimed here until it runs.
 | 4c | Export to `.mbox` and `.msg` | ✅ done |
 | 8 | The window | ✅ done |
 
-39 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
+40 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
 the public fixtures from freepst, fetched by `tests\fetch-fixtures.ps1`. Test files are
 not committed, because real PSTs contain real mail; the tests skip rather than fail when
 they are absent.

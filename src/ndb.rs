@@ -175,6 +175,32 @@ pub struct Recovered {
     /// Conflicts where no copy could be confirmed against the bytes on disk, so the
     /// latest was taken on faith. These are the entries most likely to be wrong.
     pub unresolved: usize,
+    /// Nodes whose recovered revision cannot be vouched for. Named rather than counted:
+    /// "some of your mail may be an old copy" is useless, "this message may be an old
+    /// copy" can be checked by the person reading it.
+    pub stale: Vec<Stale>,
+}
+
+/// A node the sweep could only offer an unconfirmable revision of.
+///
+/// The honest limit of what can be known here: a PST frees an index page by unlinking it
+/// and leaving the bytes, so the sweep finds old entries alongside current ones and has
+/// to choose. Where the copies disagree the highest block id wins, because block ids come
+/// from a counter that only goes up — but if the page holding the *newest* entry is one of
+/// the ones that was lost, the highest id still present is an older revision, and nothing
+/// in the file says so. That node reads perfectly and quietly gives you last week's copy.
+/// It cannot be fixed. It can be named.
+#[derive(Debug, Clone, Copy)]
+pub struct Stale {
+    pub nid: u32,
+    /// Distinct data blocks the surviving entries named. More than one means a choice was
+    /// made, and the choice is only as good as the newest entry having survived.
+    pub versions: usize,
+    /// The chosen entry points at a block that is not in the recovered index at all, so
+    /// this revision cannot be read, never mind confirmed as the current one.
+    pub dangling: bool,
+    /// The data block the chosen entry named, so the finding can be dug into.
+    pub bid_data: u64,
 }
 
 /// One entry in a node's subnode tree.
@@ -842,11 +868,45 @@ impl Pst {
         // allocator happened to find room.
         for (nid, mut v) in nodes {
             r.superseded += v.len() - 1;
-            v.sort_by_key(|(_, n)| (live.contains_key(&(n.bid_data & !1)), n.bid_data));
+            // bid_sub breaks the tie when two copies name the same data block, and it has
+            // to: a node whose subnode tree moved but whose data did not is a real and
+            // ordinary edit — a message gaining an attachment does exactly that. Ranking
+            // by data block alone leaves those settled by file position, which says only
+            // where the allocator found room, and on the test PST it picks the older
+            // subnode tree for one node out of 129. Block ids come off a counter that only
+            // ever goes up, so the same argument that makes bid_data a good signal makes
+            // bid_sub one too.
+            v.sort_by_key(|(_, n)| {
+                (
+                    live.contains_key(&(n.bid_data & !1)),
+                    n.bid_data,
+                    n.bid_sub,
+                )
+            });
             let pick = v.last().unwrap().1;
+
+            // Duplicate copies of the *same* entry are the normal case and say nothing —
+            // a page was rewritten and the old one still lies there naming the same block.
+            // Only copies that disagree about which block holds the node's data mean a
+            // revision was chosen between, so that is what gets reported.
+            let versions = v
+                .iter()
+                .map(|(_, n)| (n.bid_data & !1, n.bid_sub & !1))
+                .collect::<HashSet<(u64, u64)>>()
+                .len();
+            let dangling = pick.bid_data != 0 && !live.contains_key(&(pick.bid_data & !1));
+            if versions > 1 || dangling {
+                r.stale.push(Stale {
+                    nid,
+                    versions,
+                    dangling,
+                    bid_data: pick.bid_data,
+                });
+            }
             r.nodes.push(Node { nid, ..pick });
         }
 
+        r.stale.sort_by_key(|s| s.nid);
         r.nodes.sort_by_key(|n| n.nid);
         r.blocks = live.into_values().collect();
         r.blocks.sort_by_key(|b| b.bid);
@@ -1029,6 +1089,45 @@ mod tests {
     #[test]
     fn password_is_not_a_lock() {
         survey("passworded.pst");
+    }
+
+    /// The sweep must reach the same answer as the file's own index, on every node the
+    /// two have in common.
+    ///
+    /// This is the only ground truth available for recovery. An undamaged file carries the
+    /// authoritative index *and* the freed pages the sweep reads, so the sweep can be run
+    /// against a file whose right answer is already known — and where the two disagree,
+    /// the sweep is simply wrong. It caught a real one: with the tie broken on the data
+    /// block alone, one node in dist-list.pst came back with an older subnode tree.
+    ///
+    /// The sweep finding *extra* nodes is not a disagreement. Those are deleted items whose
+    /// entries the index dropped and the freed pages kept, and digging them out is the
+    /// entire point of sweeping.
+    #[test]
+    fn the_sweep_agrees_with_the_index_it_replaces() {
+        for name in ["dist-list.pst", "example-2013.ost", "passworded.pst"] {
+            let Some(mut pst) = open(name) else { return };
+            let live: BTreeMap<u32, Node> = pst.nodes().into_iter().map(|n| (n.nid, n)).collect();
+            assert!(!live.is_empty(), "{name}: no live index to compare against");
+
+            let swept = pst.scan().nodes;
+            let mut shared = 0;
+            for n in &swept {
+                let Some(l) = live.get(&n.nid) else { continue };
+                shared += 1;
+                assert_eq!(
+                    (l.bid_data, l.bid_sub, l.nid_parent),
+                    (n.bid_data, n.bid_sub, n.nid_parent),
+                    "{name}: sweep recovered node 0x{:X} at the wrong revision",
+                    n.nid
+                );
+            }
+            assert!(
+                shared * 10 >= live.len() * 9,
+                "{name}: sweep only found {shared} of the {} indexed nodes",
+                live.len()
+            );
+        }
     }
 
     /// A half-a-file must produce a diagnosis and whatever nodes survive — not a panic,

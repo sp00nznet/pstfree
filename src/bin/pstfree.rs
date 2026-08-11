@@ -9,6 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const NID_TYPE_FOLDER: u8 = 0x02;
 const NID_TYPE_MESSAGE: u8 = 0x04;
+/// Enough named nodes to go and check, before the list becomes a count again.
+const STALE_LISTED: usize = 20;
 
 const USAGE: &str = "\
 pstfree - read, export and repair Outlook PST/OST files
@@ -158,8 +160,55 @@ fn index(pst: &mut Pst, salvage: bool) -> (Vec<Node>, Vec<Block>) {
             r.nbt_pages
         );
         nodes = r.nodes;
+        // Only worth saying here. While the file's own node index is readable it settles
+        // every one of these, and the sweep's disagreements are ghosts of freed pages
+        // rather than findings — warning about them then would be crying wolf over a
+        // healthy file. Once the sweep *is* the index, they are the real limit of it.
+        report_stale(&r.stale);
     }
     (nodes, blocks)
+}
+
+/// Name the nodes whose recovered revision cannot be vouched for.
+///
+/// A count would be worse than useless here. "Some of your mail may be an old copy" is
+/// something nobody can act on; a node id can be looked up with `--props` and the message
+/// read to see whether it is the one expected. The list is capped because a thoroughly
+/// swept file can produce a lot of them, and a wall of ids is a count again.
+fn report_stale(stale: &[pstfree::ndb::Stale]) {
+    if stale.is_empty() {
+        return;
+    }
+    let gone = stale.iter().filter(|s| s.dangling).count();
+    eprintln!(
+        "\n  {} node(s) recovered at a revision that cannot be confirmed{}:",
+        stale.len(),
+        if gone > 0 {
+            format!(", {gone} of them pointing at data that is not in the file")
+        } else {
+            String::new()
+        }
+    );
+    for s in stale.iter().take(STALE_LISTED) {
+        if s.dangling {
+            eprintln!(
+                "    - node 0x{:X}: block {} is not in the index, so this node's data is gone",
+                s.nid, s.bid_data
+            );
+        } else {
+            eprintln!(
+                "    - node 0x{:X}: {} revisions survive, took block {} as the newest",
+                s.nid, s.versions, s.bid_data
+            );
+        }
+    }
+    if stale.len() > STALE_LISTED {
+        eprintln!("    ... and {} more", stale.len() - STALE_LISTED);
+    }
+    eprintln!(
+        "  These read normally. If the page holding a node's newest index entry was one of\n  \
+         the ones lost, what survives is an older copy and nothing in the file says so."
+    );
 }
 
 /// Check everything that can be checked, and say what a sweep would find that the index

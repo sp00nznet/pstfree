@@ -1,0 +1,119 @@
+"""Head-to-head: pstfree vs libpff (pypff) on the same damaged files.
+
+Needs the reference implementation: pip install libpff-python. Not a cargo test,
+because a Python dependency has no business gating `cargo test`.
+
+libpff is the reference implementation everyone else wraps. If it reads a file and
+pstfree does not, pstfree is wrong. If pstfree recovers mail from a file libpff
+refuses, that is the entire pitch of the project, measured instead of asserted.
+"""
+import os, re, struct, subprocess, sys, tempfile
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT = os.path.join(tempfile.gettempdir(), "pstfree-bakeoff")
+PSTFREE = os.path.join(REPO, "target", "release", "pstfree.exe")
+OFF_ROOT = 180
+OFF_BREF_NBT = OFF_ROOT + 36   # bid(8) then ib(8)
+OFF_BREF_BBT = OFF_ROOT + 52
+
+
+def page_size(b):
+    ver = struct.unpack_from("<H", b, 10)[0]
+    return 4096 if ver in (36, 37) else 512
+
+
+def variants(name, b):
+    """The damage, built the same way for both tools."""
+    yield f"{name} [intact]", b
+
+    # Both B-tree roots wiped: the index is gone, only a sweep can get the mail out.
+    z = bytearray(b)
+    ps = page_size(b)
+    for off in (OFF_BREF_NBT, OFF_BREF_BBT):
+        at = struct.unpack_from("<Q", b, off + 8)[0]
+        z[at:at + ps] = b"\0" * ps
+    yield f"{name} [B-tree roots zeroed]", bytes(z)
+
+    # The back 40% of the file simply not there, as when a copy dies partway.
+    yield f"{name} [truncated to 60%]", b[: len(b) * 6 // 10]
+
+    # The fuzzer's own damage: sector-aligned junk, seeded so this is reproducible.
+    s = 0x2545F4914F6CDD1D
+    r = bytearray(b)
+    for _ in range(20):
+        s = (s * 6364136223846793005 + 1442695040888963407) & (2**64 - 1)
+        at = (s % len(r)) // 512 * 512
+        r[at:at + 512] = bytes((s >> (i % 8 * 8)) & 0xFF for i in range(512))
+    yield f"{name} [20 junk sectors]", bytes(r)
+
+
+def ask_libpff(path):
+    import pypff
+    f = pypff.file()
+    try:
+        f.open(path)
+    except Exception as e:
+        return "refused to open", 0
+    try:
+        n = [0]
+
+        def walk(folder, depth=0):
+            if depth > 32:
+                return
+            for i in range(folder.get_number_of_sub_messages()):
+                folder.get_sub_message(i)
+                n[0] += 1
+            for i in range(folder.get_number_of_sub_folders()):
+                walk(folder.get_sub_folder(i), depth + 1)
+
+        walk(f.get_root_folder())
+        return "read", n[0]
+    except Exception as e:
+        return f"failed: {type(e).__name__}", 0
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
+
+
+def ask_pstfree(path):
+    for args in ([], ["--salvage"]):
+        try:
+            p = subprocess.run([PSTFREE, path, "--list"] + args,
+                               capture_output=True, text=True, timeout=180)
+        except subprocess.TimeoutExpired:
+            return "timed out", 0
+        # Trust pstfree's own footer, not a guess at its table: a message with no
+        # delivery time prints a blank date, and counting dated lines silently loses it.
+        m = re.search(r"^(\d+) message\(s\)", p.stdout, re.M)
+        n = int(m.group(1)) if m else 0
+        if n:
+            return ("read" if not args else "read (salvage)"), n
+        if p.returncode != 0:
+            return f"exit {p.returncode}", 0
+    return "no messages", 0
+
+
+def main():
+    os.makedirs(OUT, exist_ok=True)
+    rows = []
+    for name in ("dist-list.pst", "example-2013.ost", "passworded.pst"):
+        src = os.path.join(REPO, "tests", "data", name)
+        if not os.path.exists(src):
+            continue
+        b = open(src, "rb").read()
+        for label, data in variants(name, b):
+            path = os.path.join(OUT, re.sub(r"[^\w.-]", "_", label))
+            open(path, "wb").write(data)
+            rows.append((label,) + ask_libpff(path) + ask_pstfree(path))
+
+    w = max(len(r[0]) for r in rows)
+    print(f"{'case'.ljust(w)} | {'libpff':<22} {'msgs':>5} | {'pstfree':<16} {'msgs':>5}")
+    print("-" * (w + 60))
+    for label, ls, ln, ps, pn in rows:
+        print(f"{label.ljust(w)} | {ls:<22} {ln:>5} | {ps:<16} {pn:>5}")
+
+
+if __name__ == "__main__":
+    main()
