@@ -454,7 +454,9 @@ fn list(pst: &mut Pst, nodes: &[Node]) {
         }
     }
 
-    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    // Newest first, and the timestamp is a plain u64, so reversing the key beats comparing
+    // backwards by hand.
+    rows.sort_by_key(|r| std::cmp::Reverse(r.0));
     println!("{:<16}  {:<22}  {:<20}  subject", "date", "folder", "from");
     for (when, folder, from, subject, size) in &rows {
         println!(
