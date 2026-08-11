@@ -101,7 +101,7 @@ Wrote fixed.pst: 128 node(s), 184 block(s), 124928 bytes.
 
 libpff refuses to open `torn.pst` and reads all four messages out of `fixed.pst`.
 
-| | |
+| command | what it does |
 |---|---|
 | `--tree` | the folder tree, with message counts |
 | `--list` | every message: date, folder, sender, subject |
