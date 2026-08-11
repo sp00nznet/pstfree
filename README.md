@@ -376,9 +376,24 @@ promised.
   libpff reads all of this identically, so it is what Outlook wrote rather than a
   misparse. Export was already using `0x1000` and `0x1013`, so the only thing to fix was
   the typing (below).
-- **Named properties (`0x8000` and up) are shown by number, not by name.** Resolving them
-  means reading the name-to-id map in node `0x61`. They are visible and intact in
-  `--props`; they just have no labels yet.
+- ~~**Named properties (`0x8000` and up) are shown by number, not by name.**~~ **Done.**
+  Those ids are not fixed by any specification — each file numbers them as it happens to
+  meet them, so the same number means different things in two PSTs and printing it alone
+  is close to printing nothing. `--props` now reads the file's own map in node `0x61` and
+  labels them:
+
+  ```
+  0x8004  time         2016-08-02 15:00  PSETID_Appointment 0x820D
+  0x8005  time         2016-08-02 15:30  PSETID_Appointment 0x820E
+  0x800E  string       "someone@example.com"  PSETID_Common 0x8580
+  ```
+
+  Which is checkable rather than merely plausible: `0x820D` is `PidLidAppointmentStartWhole`
+  and `0x820E` the matching End, and the two times are half an hour apart on the
+  appointment that says it is half an hour long. A map off by a single entry would still
+  print something that looked fine, and would not survive that. Nine well-known property
+  sets are spelled out by name and the rest print as GUIDs. A file that has lost node
+  `0x61` still lists its properties, and says why they have no labels.
 - **`NDB_CRYPT_CYCLIC` is implemented but has never decoded a real file.** No fixture uses
   it. The specification calls it a symmetric cipher and the test checks that running it
   twice returns the original bytes, which is the only evidence behind it. Permute is
@@ -566,7 +581,7 @@ Updated as things land. Nothing is claimed here until it runs.
 | 8 | The window | ✅ done |
 | 9 | `--rebuild` — write the damage back out as a clean `.pst` | ✅ done — Unicode PST, under 32MB |
 
-43 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
+45 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
 the public fixtures from freepst, fetched by `tests\fetch-fixtures.ps1`. Test files are
 not committed, because real PSTs contain real mail; the tests skip rather than fail when
 they are absent.

@@ -518,7 +518,12 @@ fn props(pst: &mut Pst, nodes: &[Node], want: Option<&str>) {
         std::process::exit(1);
     };
 
-    match read_node_pc(pst, node) {
+    let node = *node;
+    // Ids from 0x8000 up are numbered per file rather than by any specification, so the
+    // number alone says nothing. The file's own map says what they stand for.
+    let named = ltp::read_names(pst, nodes);
+
+    match read_node_pc(pst, &node) {
         Err(e) => eprintln!("0x{nid:X}: {e}"),
         Ok(pc) => {
             println!(
@@ -528,7 +533,16 @@ fn props(pst: &mut Pst, nodes: &[Node], want: Option<&str>) {
                 pc.from_subnode
             );
             for (id, v) in &pc.props {
-                println!("  0x{id:04X}  {}", describe(v));
+                match named.get(*id) {
+                    Some(n) => println!("  0x{id:04X}  {}  {n}", describe(v)),
+                    None => println!("  0x{id:04X}  {}", describe(v)),
+                }
+            }
+            if pc.props.keys().any(|id| *id >= 0x8000) && named.is_empty() {
+                println!(
+                    "\n  This file's name-to-id map (node 0x61) could not be read, so the \
+                     properties\n  at 0x8000 and above can only be shown by number."
+                );
             }
         }
     }

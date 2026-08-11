@@ -221,6 +221,139 @@ pub enum Value {
     },
 }
 
+/// The node holding the map from property ids of 0x8000 and up to what they mean.
+pub const NID_NAME_TO_ID_MAP: u32 = 0x61;
+
+// The three streams the map is kept in, each a single property on that node.
+const PID_NAMEID_GUIDS: u16 = 0x0002;
+const PID_NAMEID_ENTRIES: u16 = 0x0003;
+const PID_NAMEID_STRINGS: u16 = 0x0004;
+
+/// The property sets worth spelling out. A GUID tells the reader nothing; `PSETID_Appointment`
+/// tells them they are looking at a calendar item's own fields. The rest print as GUIDs.
+const WELL_KNOWN: [(&str, &str); 9] = [
+    ("PS_MAPI", "{00020328-0000-0000-C000-000000000046}"),
+    ("PS_PUBLIC_STRINGS", "{00020329-0000-0000-C000-000000000046}"),
+    ("PSETID_Appointment", "{00062002-0000-0000-C000-000000000046}"),
+    ("PSETID_Task", "{00062003-0000-0000-C000-000000000046}"),
+    ("PSETID_Address", "{00062004-0000-0000-C000-000000000046}"),
+    ("PSETID_Common", "{00062008-0000-0000-C000-000000000046}"),
+    ("PSETID_Log", "{0006200A-0000-0000-C000-000000000046}"),
+    ("PSETID_Note", "{0006200E-0000-0000-C000-000000000046}"),
+    ("PSETID_Meeting", "{6ED8DA90-450B-101B-98DA-00AA003F1305}"),
+];
+
+/// What the property ids at 0x8000 and above stand for in this particular file.
+///
+/// They are not fixed by any specification. Each file numbers them as it happens to meet
+/// them, so the same id means different things in two PSTs, and printing the number alone
+/// is close to printing nothing. The mapping is kept in the file, in node 0x61.
+#[derive(Default)]
+pub struct Names(BTreeMap<u16, String>);
+
+impl Names {
+    pub fn get(&self, id: u16) -> Option<&str> {
+        self.0.get(&id).map(String::as_str)
+    }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// A GUID as Windows writes it: the first three fields little-endian, the last two not.
+fn guid_str(b: &[u8]) -> String {
+    let s = format!(
+        "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{}}}",
+        u32::from_le_bytes(b[0..4].try_into().unwrap()),
+        u16::from_le_bytes(b[4..6].try_into().unwrap()),
+        u16::from_le_bytes(b[6..8].try_into().unwrap()),
+        b[8],
+        b[9],
+        b[10..16].iter().map(|x| format!("{x:02X}")).collect::<String>()
+    );
+    match WELL_KNOWN.iter().find(|(_, g)| *g == s) {
+        Some((name, _)) => (*name).to_string(),
+        None => s,
+    }
+}
+
+/// Read the name-to-id map, so named properties can be shown as names.
+///
+/// Returns an empty map rather than an error when the node is missing or unreadable: a
+/// damaged file often loses it, and losing the labels is not a reason to stop showing the
+/// properties themselves.
+pub fn read_names(pst: &mut Pst, nodes: &[Node]) -> Names {
+    let Some(node) = nodes.iter().find(|n| n.nid == NID_NAME_TO_ID_MAP) else {
+        return Names::default();
+    };
+    let Ok(pc) = read_node_pc(pst, node) else {
+        return Names::default();
+    };
+    let bytes = |id: u16| match pc.props.get(&id) {
+        Some(Value::Bytes(b)) => b.clone(),
+        _ => Vec::new(),
+    };
+    let (guids, entries, strings) = (
+        bytes(PID_NAMEID_GUIDS),
+        bytes(PID_NAMEID_ENTRIES),
+        bytes(PID_NAMEID_STRINGS),
+    );
+
+    let mut out = BTreeMap::new();
+    // NAMEID: dwPropertyID, then the N bit and a 15-bit GUID index, then the index that
+    // says which 0x8000-and-up id this record is describing.
+    for e in entries.chunks_exact(8) {
+        let dw = u32::from_le_bytes(e[0..4].try_into().unwrap());
+        let w = u16::from_le_bytes(e[4..6].try_into().unwrap());
+        let id = 0x8000u32 + u16::from_le_bytes(e[6..8].try_into().unwrap()) as u32;
+        if id > 0xFFFF {
+            continue;
+        }
+        let (is_string, gi) = (w & 1 == 1, (w >> 1) as usize);
+
+        let set = match gi {
+            0 => String::new(),
+            1 => "PS_MAPI".into(),
+            2 => "PS_PUBLIC_STRINGS".into(),
+            n => match guids.get((n - 3) * 16..(n - 3) * 16 + 16) {
+                Some(g) => guid_str(g),
+                None => String::new(),
+            },
+        };
+
+        // A string name is a length in bytes then UTF-16, at an offset into the string
+        // stream. A numeric one is simply the number, and only means anything alongside
+        // the property set it belongs to.
+        let name = if is_string {
+            let at = dw as usize;
+            let len = match strings.get(at..at + 4) {
+                Some(l) => u32::from_le_bytes(l.try_into().unwrap()) as usize,
+                None => continue,
+            };
+            match strings.get(at + 4..at + 4 + len) {
+                Some(s) => {
+                    let u: Vec<u16> = s.chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    format!("\"{}\"", String::from_utf16_lossy(&u))
+                }
+                None => continue,
+            }
+        } else {
+            format!("0x{dw:04X}")
+        };
+
+        out.insert(
+            id as u16,
+            if set.is_empty() { name } else { format!("{set} {name}") },
+        );
+    }
+    Names(out)
+}
+
 /// A property context: every property on a folder, message or attachment.
 pub struct Pc {
     pub props: BTreeMap<u16, Value>,
@@ -679,6 +812,74 @@ mod tests {
         }
         assert!(!names.is_empty(), "{file}: no folder names at all");
         names
+    }
+
+    fn fixture(file: &str) -> Option<Pst> {
+        let path = format!("tests/data/{file}");
+        if !std::path::Path::new(&path).exists() {
+            eprintln!("skipping {file}: run tests/fetch-fixtures.ps1");
+            return None;
+        }
+        Some(Pst::open(&path).expect("fixture should open"))
+    }
+
+    /// A named property id means nothing on its own, and the file says what it means.
+    ///
+    /// The check that matters is not that a label appears but that it is the *right* one.
+    /// 0x8004 on the appointment resolves to PSETID_Appointment 0x820D, which MS-OXPROPS
+    /// calls PidLidAppointmentStartWhole — and the value stored under it is a time, half
+    /// an hour before the 0x8005 that resolves to the matching End. A mapping off by one
+    /// entry would still print something perfectly plausible and would not survive that.
+    #[test]
+    fn named_properties_resolve_to_what_they_actually_are() {
+        let Some(mut pst) = fixture("dist-list.pst") else { return };
+        let nodes = pst.nodes();
+        let names = read_names(&mut pst, &nodes);
+
+        assert!(!names.is_empty(), "no name-to-id map read at all");
+        assert!(
+            (0..0x8000u16).all(|id| names.get(id).is_none()),
+            "the map should only ever describe ids from 0x8000 up"
+        );
+        assert_eq!(names.get(0x8004), Some("PSETID_Appointment 0x820D"));
+        assert_eq!(names.get(0x8005), Some("PSETID_Appointment 0x820E"));
+
+        let appt = *nodes.iter().find(|n| n.nid == 0x2000C4).expect("the appointment");
+        let pc = read_node_pc(&mut pst, &appt).expect("appointment should read");
+        assert!(
+            matches!(pc.props.get(&0x8004), Some(Value::Time(_))),
+            "PidLidAppointmentStartWhole should hold a time, not {:?}",
+            pc.props.get(&0x8004)
+        );
+    }
+
+    /// The other half of the map: names that are text rather than numbers. They live at an
+    /// offset into a separate stream behind a length prefix, which is the easier half to
+    /// get wrong and the half that fails by returning something empty rather than by
+    /// failing.
+    #[test]
+    fn string_named_properties_come_back_as_text() {
+        for file in ["dist-list.pst", "example-2013.ost"] {
+            let Some(mut pst) = fixture(file) else { return };
+            let nodes = pst.nodes();
+            let names = read_names(&mut pst, &nodes);
+            let strings: Vec<&str> = (0x8000..=0xFFFFu32)
+                .filter_map(|id| names.get(id as u16))
+                .filter(|n| n.contains('"'))
+                .collect();
+            if strings.is_empty() {
+                continue;
+            }
+            for s in &strings {
+                assert!(
+                    !s.ends_with("\"\""),
+                    "{file}: {s:?} came back with an empty name — the offset into the \
+                     string stream is wrong"
+                );
+            }
+            return;
+        }
+        eprintln!("neither fixture uses a string-named property; nothing checked here");
     }
 
     /// Messages are where properties outgrow the node's own heap, so this is the check
