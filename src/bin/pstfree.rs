@@ -20,6 +20,7 @@ pstfree - read, export and repair Outlook PST/OST files
   pstfree <file.pst> --list     every message: date, folder, sender, subject
   pstfree <file.pst> --props <nid>   every property on one node, as stored
   pstfree <file.pst> --export <dir> [--format eml|mbox|msg]   write the mail out
+  pstfree <file.pst> --rebuild <out.pst>   write a clean copy with a fresh index
   pstfree <file.pst> --verify   check every checksum, and what a sweep would recover
   pstfree <file.pst> --nodes    every node in the file
   pstfree <file.pst> --blocks   every block in the file
@@ -54,6 +55,49 @@ fn main() {
 
     match args.get(1).map(String::as_str) {
         Some("--verify") => return verify(&mut pst, &nodes, &blocks),
+        Some("--rebuild") => {
+            let Some(out) = args.get(2) else {
+                eprintln!("--rebuild needs somewhere to write, e.g. --rebuild fixed.pst");
+                std::process::exit(2);
+            };
+            match pstfree::repair::rebuild(&mut pst, &nodes, &blocks, out) {
+                Ok(r) => {
+                    println!(
+                        "Wrote {out}: {} node(s), {} block(s), {} bytes.",
+                        r.nodes, r.blocks, r.bytes
+                    );
+                    if r.dropped_blocks > 0 || r.dropped_nodes > 0 {
+                        println!(
+                            "  Left out {} block(s) that failed their checksum and {} node(s) \
+                             whose data they held.",
+                            r.dropped_blocks, r.dropped_nodes
+                        );
+                    }
+                    if r.missing.is_empty() {
+                        println!(
+                            "  The allocation maps are marked invalid, which is the documented \
+                             way to say\n  'rebuild these before writing' — Outlook does that \
+                             on open. Reading the\n  new file back will report that one thing, \
+                             and it is meant to."
+                        );
+                    } else {
+                        // Handing back a file that silently will not open is the exact
+                        // behaviour this project exists to be the opposite of.
+                        println!(
+                            "\n  This file will NOT open: it has no {}.\n  \
+                             That node's data block did not survive, and no index can point \
+                             at bytes\n  that are gone. pstfree itself still reads the \
+                             result, so --export is the\n  way to get this mail out.",
+                            r.missing.join(", no ")
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some("--tree") => tree(&mut pst, &nodes),
         Some("--list") => list(&mut pst, &nodes),
         Some("--props") => props(&mut pst, &nodes, args.get(2).map(String::as_str)),

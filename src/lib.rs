@@ -9,3 +9,4 @@ pub mod crypt;
 pub mod export;
 pub mod ltp;
 pub mod ndb;
+pub mod repair;

@@ -95,6 +95,32 @@ def ask_pstfree(path):
     return "no messages", 0
 
 
+def rebuilds():
+    """Damaged in, repaired out, and libpff as the judge of whether it worked.
+
+    This is the only test of a repair that means anything: pstfree reading a file pstfree
+    wrote proves nothing at all. A file the reference implementation refuses, rebuilt into
+    one the reference implementation reads, is the whole claim in one line.
+    """
+    print("\nrepair, judged by libpff\n")
+    print(f"  {'damaged input':34} | {'libpff on it':16} | libpff on the rebuild")
+    print("  " + "-" * 78)
+    for name in ("dist-list.pst", "passworded.pst"):
+        src = os.path.join(REPO, "tests", "data", name)
+        if not os.path.exists(src):
+            continue
+        for label, data in variants(name, open(src, "rb").read()):
+            dmg = os.path.join(OUT, "r_" + re.sub(r"[^\w.-]", "_", label))
+            open(dmg, "wb").write(data)
+            fixed = dmg + "-fixed.pst"
+            p = subprocess.run([PSTFREE, dmg, "--rebuild", fixed, "--salvage"],
+                               capture_output=True, text=True, timeout=300)
+            after = ask_libpff(fixed)[0] if os.path.exists(fixed) else "not written"
+            if "NOT open" in p.stdout:
+                after += " (pstfree said so)"
+            print(f"  {label:34} | {ask_libpff(dmg)[0]:16} | {after}")
+
+
 def compare_properties():
     """Every property of every message, both tools, and where they disagree.
 
@@ -164,6 +190,7 @@ def main():
     for label, ls, ln, ps, pn in rows:
         print(f"{label.ljust(w)} | {ls:<22} {ln:>5} | {ps:<16} {pn:>5}")
 
+    rebuilds()
     compare_properties()
 
 

@@ -334,7 +334,8 @@ attachments, embedded messages, plain/HTML/compressed-RTF bodies, calendar and c
 Password ignored, because there is nothing there to ignore.
 
 **Export** — `.eml` per message with attachments inline, `.mbox` per folder, or `.msg`
-with the MAPI properties kept. Rebuilding a clean `.pst` from a damaged one is still to come.
+with the MAPI properties kept. Or `--rebuild`, which writes the damaged file back out as a
+clean `.pst` — the thing the paid tools actually sell, and the one Outlook can just open.
 
 **Repair** — the differentiator, and the only genuinely hard part. All four now work:
 
@@ -424,6 +425,53 @@ promised.
   While the file's own index is readable it settles all of this, and warning then would
   be crying wolf over a healthy file.
 
+### Writing the file back out
+
+```
+pstfree broken.pst --rebuild fixed.pst --salvage
+```
+
+Reading a damaged store gets the mail out. `--rebuild` gets the *file* back, which is the
+thing every paid tool actually charges for and the only outcome that ends with someone
+double-clicking a `.pst` again.
+
+Almost nothing has to be understood to do it, and that is the whole design. A damaged PST
+is nearly always a broken **index** over intact **contents** — the blocks holding the
+heaps, the property contexts and the tables are fine, and it is the B-trees, the header
+and the checksums over them that are wrong. So every surviving block is copied byte for
+byte, obfuscation and all, and only the index around them is built fresh. Nothing in the
+repair path parses a property or a heap, which is exactly why it cannot corrupt one.
+
+Precisely one byte of a copied block changes: a block trailer carries `wSig`, computed
+from the block's own offset and id, and the offset is what a rebuild moves. The length,
+the CRC over the data and the id all describe bytes that did not change, so they cross
+over untouched. The allocation maps go out marked `INVALID_AMAP`, which is not a fudge but
+the state MS-PST 2.6.1.3.7 defines for "rebuild these before writing" — Outlook does that
+on open. Their *slots* are still reserved, because a rebuild writes them at fixed offsets
+and anything living there would be overwritten.
+
+The proof is not that pstfree can read what pstfree wrote, which proves nothing at all:
+
+| damaged input | libpff on it | rebuilt, then libpff |
+|---|---|---|
+| B-tree roots zeroed | refuses to open | **reads all 4 messages** |
+| 20 junk sectors | refuses to open | still refuses — *and pstfree says so first* |
+
+That second row is the more important one. Those junk sectors landed on the block holding
+the message store, and no index can point at bytes that are gone, so the rebuilt file
+genuinely will not open. It says so, by name, instead of handing back a file that fails
+silently later:
+
+```
+This file will NOT open: it has no message store (node 0x21).
+```
+
+Two things it refuses outright rather than half-doing. An **OST** is 4K pages and
+zlib-compressed blocks, so turning one into a PST is a format conversion and not a repair.
+And a rebuild over **32MB** would need Free Map pages, whose positions MS-PST gives only in
+a diagram — writing one at a guess would have Outlook overwrite live data the first time it
+allocated. Both say so and point at `--export`.
+
 ### Measured against libpff
 
 [libpff] is the reference implementation nearly every other PST tool wraps, and it is the
@@ -439,6 +487,7 @@ builds the same damaged files for both and asks each one how much mail it can ge
 | B-tree roots zeroed | refuses to open | reads all of them |
 | truncated to 60% | reads | reads |
 | 20 junk sectors | refuses to open, or `OSError` | reads all of them |
+| **a `--rebuild` of the roots-zeroed file** | **reads it** | — |
 
 Exact agreement on every undamaged file, and not only on the message count: every
 property of every message, 686 of them, id for id, with nothing either tool sees that the
@@ -515,8 +564,9 @@ Updated as things land. Nothing is claimed here until it runs.
 | 3c | Table contexts — recipients, and a second opinion on membership | ✅ done |
 | 4c | Export to `.mbox` and `.msg` | ✅ done |
 | 8 | The window | ✅ done |
+| 9 | `--rebuild` — write the damage back out as a clean `.pst` | ✅ done — Unicode PST, under 32MB |
 
-41 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
+43 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
 the public fixtures from freepst, fetched by `tests\fetch-fixtures.ps1`. Test files are
 not committed, because real PSTs contain real mail; the tests skip rather than fail when
 they are absent.

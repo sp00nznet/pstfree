@@ -996,6 +996,44 @@ impl Pst {
         self.bbt = Some(blocks.iter().map(|b| (b.bid & !1, *b)).collect());
     }
 
+    /// A block exactly as it sits on disk: data, padding and trailer, nothing decoded.
+    ///
+    /// [`block`](Self::block) hands back the *contents* — deobfuscated and, on an OST,
+    /// inflated. Copying a block into a rebuilt file wants the opposite: the bytes
+    /// untouched, so whatever encoding they carry keeps working without this ever having
+    /// to understand it.
+    pub fn raw_block(&mut self, b: &Block) -> Result<Vec<u8>, String> {
+        let back = self.page.block_trailer_back;
+        let total = (b.cb as u64 + back).div_ceil(self.page.block_align) * self.page.block_align;
+        if b.ib + total > self.actual_len {
+            return Err(format!("block {} runs past the end of the file", b.bid));
+        }
+        let mut buf = vec![0u8; total as usize];
+        self.file
+            .seek(SeekFrom::Start(b.ib))
+            .map_err(|e| e.to_string())?;
+        self.file.read_exact(&mut buf).map_err(|e| e.to_string())?;
+        Ok(buf)
+    }
+
+    /// The file's own header bytes, for a rebuild to start from rather than invent.
+    ///
+    /// Most of a header is fields a repair has no opinion about — the crypt method, the
+    /// client version, the reserved runs. Copying it and overwriting only what moved is
+    /// both less code and less to get wrong than building all 564 bytes from the spec.
+    pub fn header_bytes(&mut self) -> Result<Vec<u8>, String> {
+        let mut h = vec![0u8; HEADER_LEN];
+        self.file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        self.file.read_exact(&mut h).map_err(|e| e.to_string())?;
+        Ok(h)
+    }
+
+    /// 512-byte pages, the layout MS-PST actually documents. The 4K variant an Outlook
+    /// 2013 OST uses is a different beast and cannot be written by the same code.
+    pub fn is_small_page(&self) -> bool {
+        self.page.size == 512
+    }
+
     /// Every block in the file, in B-tree order.
     pub fn blocks(&mut self) -> Vec<Block> {
         let mut out = Vec::new();
