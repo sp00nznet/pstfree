@@ -803,17 +803,6 @@ unsafe fn do_rebuild(hwnd: HWND, app: &mut App) {
     if !ready(hwnd, app) {
         return;
     }
-    if app.pst.as_ref().is_some_and(|p| !p.is_small_page()) {
-        message_box(
-            hwnd,
-            "This is a 4K-page file — an Outlook 2013 or later OST. Turning one into a PST \
-             is a format conversion rather than a repair, and is not written yet. Export \
-             the mail instead.",
-            "pstfree",
-            MB_ICONWARNING,
-        );
-        return;
-    }
     let Some(out) = pick_save(hwnd) else { return };
     if std::path::Path::new(&out) == std::path::Path::new(&app.path) {
         message_box(
@@ -835,6 +824,15 @@ unsafe fn do_rebuild(hwnd: HWND, app: &mut App) {
                     "Wrote {out}\n\n{} node(s), {} block(s), {} bytes.",
                     r.nodes, r.blocks, r.bytes
                 );
+                if r.converted {
+                    msg += "\n\nConverted from an Outlook 2013 OST. Every block was \
+                            decoded, inflated and laid out again as a PST stores them, so \
+                            this is a new file rather than a copy of the old one — check \
+                            it against the original before deleting anything.";
+                }
+                for p in &r.problems {
+                    msg += &format!("\n\n{p}");
+                }
                 if r.dropped_blocks > 0 || r.dropped_nodes > 0 {
                     msg += &format!(
                         "\n\nLeft out {} block(s) that failed their own checksum, and {} \

@@ -13,6 +13,7 @@
 pub type Progress<'a> = &'a mut dyn FnMut(u64, u64);
 
 pub mod cfbf;
+pub mod convert;
 pub mod crypt;
 pub mod export;
 pub mod ltp;

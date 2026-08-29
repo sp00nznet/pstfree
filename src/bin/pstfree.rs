@@ -21,6 +21,7 @@ pstfree - read, export and repair Outlook PST/OST files
   pstfree <file.pst> --props <nid>   every property on one node, as stored
   pstfree <file.pst> --export <dir> [--format eml|mbox|msg]   write the mail out
   pstfree <file.pst> --rebuild <out.pst>   write a clean copy with a fresh index
+  pstfree <file.ost> --rebuild <out.pst>   convert an OST into a PST
   pstfree <file.pst> --verify   check every checksum, and what a sweep would recover
   pstfree <file.pst> --nodes    every node in the file
   pstfree <file.pst> --blocks   every block in the file
@@ -104,6 +105,17 @@ fn main() {
                         "Wrote {out}: {} node(s), {} block(s), {} bytes.",
                         r.nodes, r.blocks, r.bytes
                     );
+                    if r.converted {
+                        println!(
+                            "  Converted from an Outlook 2013 OST. Every block was decoded, \
+                             inflated and\n  laid out again as a PST stores them, so this is \
+                             a new file rather than a copy\n  of the old one — check it \
+                             against the original before deleting anything."
+                        );
+                    }
+                    for p in &r.problems {
+                        println!("  - {p}");
+                    }
                     if r.dropped_blocks > 0 || r.dropped_nodes > 0 {
                         println!(
                             "  Left out {} block(s) that failed their checksum and {} node(s) \

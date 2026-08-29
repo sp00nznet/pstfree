@@ -35,6 +35,10 @@ Here is what they are selling:
   "**keyless**" in as many words. The products charging $30–$50 to "recover" a PST password
   are charging you to skip an `if` statement. pstfree reads a password-protected file and
   never asks; there is no code in it that could.
+- **"OST to PST" is a format conversion, and the format is the published one.** An
+  Outlook 2013 OST is the same file the specification describes, with 4K pages and its
+  blocks zlib-compressed. Reading it out and writing it back as a PST is work, but it is
+  ordinary work against a document anyone can download. `--rebuild` does it.
 - **Repair is the only genuinely hard part** — and the part the marketing is vaguest about.
 
 **If anyone tries to sell you this software, they're scamming you. Walk away.**
@@ -109,7 +113,7 @@ libpff refuses to open `torn.pst` and reads all four messages out of `fixed.pst`
 | `--list` | every message: date, folder, sender, subject |
 | `--props <nid>` | every property on one node, named where the file names them |
 | `--export <dir> [--format eml\|mbox\|msg]` | write the mail out |
-| `--rebuild <out.pst>` | write a clean copy with a fresh index |
+| `--rebuild <out.pst>` | write a clean copy with a fresh index — from an `.ost`, a converted `.pst` |
 | `--verify` | check every checksum, and what a sweep would recover |
 | `--salvage` | on any command: ignore the header's index and rebuild it |
 | `--version` | which build this is |
@@ -131,6 +135,13 @@ wrong; rebuild the node and block B-trees from surviving pages; carve blocks str
 of the file with no index at all; and write the result back out as a clean `.pst`, at any
 size. See [docs/repair.md](docs/repair.md).
 
+**Convert** — `--rebuild` on an `.ost` writes a `.pst`. The 4K-page format Outlook 2013 and
+later use for an OST stores blocks compressed and up to 64KB each, where a PST's are plain
+and hold 8176 bytes, so nothing can be copied: every data stream is decoded and laid out
+again. libpff reads the source OST and the converted PST and gets **46 folders, 3 messages
+and 202 properties out of each, identical id for id and byte for byte**. See
+[docs/converting.md](docs/converting.md).
+
 **The window** does all of it too. Folders, messages and bodies; export in any of the three
 formats; repair to a new `.pst`; and a plain-language report of everything wrong with the
 file rather than a count of it. The long jobs run on their own thread with a live count, so
@@ -145,9 +156,15 @@ Stated plainly, because a repair tool that overstates itself is the thing this r
 
 - **ANSI PST (Outlook 97–2002) is refused, not half-parsed.** Different header layout, 2GB
   ceiling. No sample has turned up to build it against.
-- **`--rebuild` writes 512-byte-page Unicode PSTs only.** An OST is 4K pages and
-  zlib-compressed blocks, so converting one is a format conversion rather than a repair.
-  It refuses and says so.
+- **`--rebuild` always writes a 512-byte-page Unicode PST.** Hand it an Outlook 2013 OST
+  and it converts: every block decoded, inflated and laid out again as a PST stores them.
+  That is a new file rather than a copy, so it says so, and the check that backs it is
+  libpff reading both — see below.
+- **An OST's sync-state nodes are carried across, not dropped.** Types `0x14`–`0x19` are
+  the OST's own record of its conversation with a server, and mean nothing in a PST. They
+  are kept because discarding what you do not understand is the wrong instinct in a
+  recovery tool, and because nothing has shown they do any harm. 83 of the 308 nodes in
+  the test OST are these.
 - **No rebuild has ever been opened by Outlook**, because there is no Outlook here. libpff
   opens them and every block in them re-reads and re-checksums, which is evidence but is
   not that claim.
@@ -166,7 +183,7 @@ The full list, including the places the first reading of the spec was wrong, is 
 
 ## How it is tested
 
-47 tests, against a real PST, a real 2013 OST and a real password-protected PST — the
+49 tests, against a real PST, a real 2013 OST and a real password-protected PST — the
 public fixtures from [freepst], fetched by `tests\fetch-fixtures.ps1`. Test files are never
 committed, because real PSTs contain real mail; the tests skip rather than fail when they
 are absent.
@@ -180,6 +197,7 @@ can offer about its own recovery, in [docs/testing.md](docs/testing.md).
 ## Documentation
 
 - [docs/repair.md](docs/repair.md) — how recovery works, and writing the file back out
+- [docs/converting.md](docs/converting.md) — OST to PST, and the one thing that makes it hard
 - [docs/exporting.md](docs/exporting.md) — `.eml`, `.mbox`, `.msg`, and the rules
 - [docs/testing.md](docs/testing.md) — libpff head-to-head, fuzzing, ground truth
 - [docs/findings.md](docs/findings.md) — what the spec got right, and what it omits

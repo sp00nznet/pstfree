@@ -21,8 +21,8 @@ use std::io::Write;
 
 /// Where the first Allocation Map lives, and how far apart they are after that.
 /// MS-PST 1.3.2.4, and the reason a rebuild cannot simply lay blocks end to end.
-const AMAP_FIRST: u64 = 0x4400;
-const AMAP_EVERY: u64 = 253_952;
+pub(crate) const AMAP_FIRST: u64 = 0x4400;
+pub(crate) const AMAP_EVERY: u64 = 253_952;
 
 /// How many 512-byte slots at the head of an AMap section are left to the map pages.
 ///
@@ -38,25 +38,25 @@ const AMAP_EVERY: u64 = 253_952;
 /// which is a superset of any reading of that figure and costs 2KB in every 248KB — 0.8%
 /// of the file, against the alternative of refusing to rebuild anything over 32MB at all.
 /// Being wrong about an interval is now merely wasteful instead of destructive.
-const MAP_SLOTS: u64 = 4;
+pub(crate) const MAP_SLOTS: u64 = 4;
 
-const PAGE: u64 = 512;
+pub(crate) const PAGE: u64 = 512;
 /// Blocks are allocated on 64-byte boundaries in the 512-byte-page format.
-const BLOCK_ALIGN: u64 = 64;
+pub(crate) const BLOCK_ALIGN: u64 = 64;
 /// BTPAGE: entries, then cEnt, cEntMax, cbEnt, cLevel, padding, and the 16-byte trailer.
 const ENTRIES_END: usize = 488;
 const TRAILER_AT: usize = 496;
-const BBTENTRY: usize = 24;
-const NBTENTRY: usize = 32;
+pub(crate) const BBTENTRY: usize = 24;
+pub(crate) const NBTENTRY: usize = 32;
 const BTENTRY: usize = 24;
 
-const PTYPE_BBT: u8 = 0x80;
-const PTYPE_NBT: u8 = 0x81;
+pub(crate) const PTYPE_BBT: u8 = 0x80;
+pub(crate) const PTYPE_NBT: u8 = 0x81;
 
 // HEADER offsets this code writes. The two id counters sit well before ROOT, which is a
 // good enough reason to name them rather than trust a mental picture of the layout.
-const OFF_BID_NEXT_P: usize = 32;
-const OFF_BID_NEXT_B: usize = 516;
+pub(crate) const OFF_BID_NEXT_P: usize = 32;
+pub(crate) const OFF_BID_NEXT_B: usize = 516;
 
 pub struct Rebuilt {
     pub nodes: usize,
@@ -73,24 +73,30 @@ pub struct Rebuilt {
     /// different sentences and only one of them is worth interrupting someone for.
     pub missing: Vec<String>,
     pub bytes: u64,
+    /// True when the source was an Outlook 2013 OST and this was a format conversion
+    /// rather than a copy. Worth saying out loud: a repair cannot corrupt a property
+    /// because it never looks at one, and a conversion has to take every block apart.
+    pub converted: bool,
+    /// Anything that had to be done at a cost, named. Empty in the ordinary case.
+    pub problems: Vec<String>,
 }
 
 /// The message store, and the folder every other folder hangs off. MS-PST 2.4.1 and 2.4.3.
-const ESSENTIAL: [(u32, &str); 2] = [(0x21, "message store"), (0x122, "root folder")];
+pub(crate) const ESSENTIAL: [(u32, &str); 2] = [(0x21, "message store"), (0x122, "root folder")];
 
 /// MS-PST 5.5: the low 32 bits of the offset XOR the id, folded in half.
-fn sig(ib: u64, bid: u64) -> u16 {
+pub(crate) fn sig(ib: u64, bid: u64) -> u16 {
     let x = (ib as u32) ^ (bid as u32);
     ((x >> 16) as u16) ^ (x as u16)
 }
 
-fn put16(b: &mut [u8], at: usize, v: u16) {
+pub(crate) fn put16(b: &mut [u8], at: usize, v: u16) {
     b[at..at + 2].copy_from_slice(&v.to_le_bytes());
 }
-fn put32(b: &mut [u8], at: usize, v: u32) {
+pub(crate) fn put32(b: &mut [u8], at: usize, v: u32) {
     b[at..at + 4].copy_from_slice(&v.to_le_bytes());
 }
-fn put64(b: &mut [u8], at: usize, v: u64) {
+pub(crate) fn put64(b: &mut [u8], at: usize, v: u64) {
     b[at..at + 8].copy_from_slice(&v.to_le_bytes());
 }
 
@@ -100,7 +106,7 @@ fn put64(b: &mut [u8], at: usize, v: u64) {
 /// MS-PST 2.6.1.3.7 defines as "rebuild these before touching the file", so their contents
 /// are Outlook's business. Their *space* is this code's business — a rebuild writes them
 /// wherever the formula says, and anything living there would be overwritten.
-fn reserved(at: u64) -> bool {
+pub(crate) fn reserved(at: u64) -> bool {
     at >= AMAP_FIRST && (at - AMAP_FIRST) % AMAP_EVERY < MAP_SLOTS * PAGE
 }
 
@@ -114,7 +120,7 @@ fn block_span(cb: u16) -> u64 {
 /// Blocks align to 64 and pages to 512 — a page landing mid-sector would still *read*,
 /// since a BREF is just an offset, but nothing else writes one there and a repair is no
 /// place to be the first.
-fn place_aligned(mut at: u64, len: u64, align: u64) -> u64 {
+pub(crate) fn place_aligned(mut at: u64, len: u64, align: u64) -> u64 {
     at = at.div_ceil(align) * align;
     loop {
         // A block may not straddle a map page either, so the whole span has to be clear.
@@ -178,7 +184,7 @@ fn build_level(
 }
 
 /// Build every level of one tree and return its root, as (bid, offset, pages to write).
-fn build_tree(
+pub(crate) fn build_tree(
     leaves: Vec<(u64, Vec<u8>)>,
     leaf_size: usize,
     ptype: u8,
@@ -227,13 +233,12 @@ pub fn rebuild(
     out: &str,
     on: crate::Progress,
 ) -> Result<Rebuilt, String> {
+    // A 4K-page file is an Outlook 2013 OST: different page size, different block size,
+    // and its blocks are compressed. None of that can be copied across, so it goes the
+    // long way round and gets rebuilt a level up, from the data streams rather than the
+    // blocks.
     if !pst.is_small_page() {
-        return Err(
-            "only the 512-byte-page Unicode PST can be rebuilt so far. An Outlook \
-                    2013 OST uses 4K pages and zlib-compressed blocks, and turning one into \
-                    a PST is a format conversion rather than a repair — use --export."
-                .into(),
-        );
+        return crate::convert::convert(pst, nodes, out, on);
     }
 
     // Blocks first: a node is only worth keeping if the block holding its data survived.
@@ -330,6 +335,13 @@ pub fn rebuild(
     let eof = next.div_ceil(BLOCK_ALIGN) * BLOCK_ALIGN;
 
     let mut header = pst.header_bytes()?;
+    // A pre-2013 OST is laid out exactly as a PST is — same pages, same blocks, same
+    // encoding — and only its header says otherwise. Copying it across is the whole of
+    // the conversion in that case, so it is done here rather than refused.
+    if pst.is_ost {
+        put16(&mut header, 8, 0x4D53); // wMagicClient: 'SM'
+        put16(&mut header, 12, 19); // wVerClient to match
+    }
     // Everything the rebuild moved or invalidated. The rest of the header is the original
     // file's and is none of this code's business.
     put64(&mut header, 184, eof); // ibFileEof
@@ -371,6 +383,8 @@ pub fn rebuild(
         dropped_nodes,
         missing,
         bytes: eof,
+        converted: false,
+        problems: Vec::new(),
     })
 }
 
@@ -424,7 +438,7 @@ fn write_out(
 
 /// Zero-fill forward to `to`. Nothing is ever placed behind the cursor, so this only ever
 /// moves forward; `saturating_sub` is there so a bug could not turn into a hang.
-fn pad(f: &mut impl Write, pos: &mut u64, to: u64) -> std::io::Result<()> {
+pub(crate) fn pad(f: &mut impl Write, pos: &mut u64, to: u64) -> std::io::Result<()> {
     const ZEROS: [u8; 4096] = [0; 4096];
     let mut left = to.saturating_sub(*pos);
     *pos += left;

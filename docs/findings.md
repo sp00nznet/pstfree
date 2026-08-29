@@ -63,17 +63,6 @@ promised.
 - **No rebuild of any size has been opened by Outlook**, large ones included. There is no
   Outlook on the machine this was written on. libpff opens them and every block in them
   re-reads and re-checksums, which is evidence, but it is not that claim.
-- **Converting an OST to a PST needs blocks re-split, not just re-encoded.** Measured
-  rather than assumed, and the answer was worse than hoped. The 4K-page format allows a
-  block far bigger than the 512-page format's 8176-byte ceiling — libpff puts it at 65536
-  and the 16MB OST fixture bears that out, with two of its 442 blocks inflating from zlib
-  to 46,397 bytes. So a conversion cannot copy those across: each has to be split into
-  8176-byte data blocks with an XBLOCK built over them, and every reference to the
-  original patched — including references from inside subnode blocks, which are
-  themselves blocks holding ids. That is what makes it a format conversion rather than a
-  repair, and it is milestone 12 rather than a footnote. The check for it already exists:
-  libpff can read the source OST and the converted PST, and the 202 properties across its
-  three messages have to match id for id.
 - **Encrypted OST.** Per MS-PST the encoding modes are keyless, but Microsoft 365 profiles
   can restrict a local cache in ways this repo hasn't tested. Needs a real sample.
 - **A node whose every surviving index entry is stale still recovers as an older
@@ -87,6 +76,32 @@ promised.
   be crying wolf over a healthy file.
 
 ## Resolved along the way
+
+- **Converting an OST does not mean patching block references, it means not keeping any.**
+  The first plan was to copy blocks across and re-split only the ones too big for a PST,
+  then patch every reference to the ones that moved. That is a trap: an XBLOCK's children
+  must be data blocks, so a data block that becomes an XBLOCK cannot be swapped in where
+  it used to sit, and the same id cannot carry over anyway because a BID's `fInternal` bit
+  is what tells a reader whether to decode the block. Working one level up — taking each
+  node's whole *data stream* and laying it out again — removes the problem rather than
+  solving it. Nothing points at a block afterwards except the index this code writes.
+
+- **The one thing that constrains it is that heaps address themselves by block number.**
+  An HID names an allocation as (which block, which allocation) — MS-PST 2.3.1.1 — so a
+  stream concatenated and re-split into neat 8176-byte pieces would leave every property
+  context and every table pointing at the wrong place. It would open, parse, and answer
+  wrongly, which is worse than failing. So the original block boundaries are kept and a
+  block is divided only when it is too big for a PST to hold; when that happens and the
+  block is a heap, it is reported rather than done quietly. The test asserts the stream
+  comes back **block for block**, not merely byte for byte, because a bytes-only
+  comparison would sail straight past exactly this.
+
+- **The oversized blocks in the OST fixture were freed ones, not live ones.** An early
+  measurement said two of 442 blocks inflate to 46,397 bytes, and that was a carve of the
+  whole file including space that had been released. Of the 310 blocks the live index
+  names, none is over 8176 and the biggest heap is 5,226. The format allows far bigger and
+  a real mailbox will have them; this fixture does not, so the splitting path is checked
+  by construction rather than by the fixture.
 
 - **The 32MB rebuild ceiling was a specification gap, and it did not need closing.** A PST
   reserves fixed slots for four kinds of allocation map page, and a rebuild that put a

@@ -21,9 +21,9 @@ Updated as things land. Nothing is claimed until it runs.
 | 9 | `--rebuild` — write the damage back out as a clean `.pst` | ✅ done — Unicode PST, under 32MB |
 | 10 | Rebuild a mailbox-sized PST: no size ceiling, and a sweep that finishes | ✅ done — verified at 726MB |
 | 11 | Repair from the window, a readable damage report, and progress on the long jobs | ✅ done |
-| 12 | **OST → PST.** `--rebuild` refuses an OST; converting one is the next milestone | ⏳ next |
+| 12 | OST → PST: decode, inflate and lay every data stream out again | ✅ done — libpff agrees on both sides |
 
-47 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
+49 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
 the public fixtures from freepst, fetched by `tests\fetch-fixtures.ps1`. Test files are
 not committed, because real PSTs contain real mail; the tests skip rather than fail when
 they are absent.

@@ -171,6 +171,76 @@ def compare_properties():
                   f"  pstfree only: {[hex(x) for x in extra]}")
 
 
+def conversion():
+    """OST to PST, judged by libpff on both sides.
+
+    Converting is the one thing here that takes a file apart and puts it back together
+    differently - every block decoded, inflated and re-laid - so "pstfree can read what
+    pstfree wrote" is worth nothing at all. The reference implementation reads the source
+    OST and the converted PST, and every folder, message and property has to match.
+    """
+    import pypff
+
+    src = os.path.join(REPO, "tests", "data", "example-2013.ost")
+    if not os.path.exists(src):
+        return
+    print("\nOST to PST, judged by libpff on both sides\n")
+    out = os.path.join(OUT, "converted-from-ost.pst")
+    r = subprocess.run([PSTFREE, src, "--rebuild", out], capture_output=True, text=True)
+    if not os.path.exists(out):
+        print(f"  conversion failed: {r.stdout.strip()} {r.stderr.strip()}")
+        return
+
+    def harvest(path):
+        f = pypff.file()
+        f.open(path)
+        msgs, folders = {}, []
+
+        def walk(folder, prefix):
+            here = prefix + "/" + (folder.name or "(root)")
+            folders.append(here)
+            for i in range(folder.number_of_sub_messages):
+                m = folder.get_sub_message(i)
+                props = {}
+                for j in range(m.number_of_record_sets):
+                    rs = m.get_record_set(j)
+                    for k in range(rs.number_of_entries):
+                        e = rs.get_entry(k)
+                        try:
+                            props[(e.entry_type, e.value_type)] = bytes(e.data or b"")
+                        except Exception:
+                            pass
+                msgs[(here, m.get_subject() or "", i)] = props
+            for sub in folder.sub_folders:
+                walk(sub, here)
+
+        walk(f.root_folder, "")
+        f.close()
+        return msgs, folders
+
+    a, fa = harvest(src)
+    b, fb = harvest(out)
+    props_a = sum(len(v) for v in a.values())
+    props_b = sum(len(v) for v in b.values())
+    print(f"  source OST        | {len(fa):>3} folders, {len(a)} message(s), {props_a} properties")
+    print(f"  converted to PST  | {len(fb):>3} folders, {len(b)} message(s), {props_b} properties")
+
+    bad = 0
+    if fa != fb:
+        bad += 1
+        print(f"    folders differ: {set(fa) ^ set(fb)}")
+    for key in sorted(set(a) | set(b), key=str):
+        if key not in a or key not in b:
+            bad += 1
+            print(f"    message only on one side: {key}")
+            continue
+        for pid in sorted(set(a[key]) | set(b[key])):
+            if a[key].get(pid) != b[key].get(pid):
+                bad += 1
+                print(f"    {key[1]!r}: property 0x{pid[0]:04X} differs")
+    print(f"\n  {'%d mismatch(es)' % bad if bad else 'Identical, id for id and byte for byte.'}")
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     rows = []
@@ -192,6 +262,7 @@ def main():
 
     rebuilds()
     compare_properties()
+    conversion()
 
 
 if __name__ == "__main__":

@@ -115,9 +115,9 @@ silently later:
 This file will NOT open: it has no message store (node 0x21).
 ```
 
-One thing it refuses outright rather than half-doing. An **OST** is 4K pages and
-zlib-compressed blocks, so turning one into a PST is a format conversion and not a repair.
-It says so and points at `--export`.
+An **OST** is not repaired but converted, because 4K pages and compressed blocks cannot be
+copied into a PST. `--rebuild` does that too now; it is a different enough job to have its
+own page, [docs/converting.md](converting.md).
 
 ## Any size
 

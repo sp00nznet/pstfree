@@ -71,7 +71,7 @@ their own index exactly, node for node, and it is a test.
 ## Running it
 
 ```
-cargo test                      # 47 tests, no fixtures needed to build
+cargo test                      # 49 tests, no fixtures needed to build
 testsetch-fixtures.ps1        # the three public fixtures, for the rest
 pip install libpff-python       # the reference implementation
 python testsakeoff.py         # the head-to-head above
