@@ -63,6 +63,17 @@ promised.
 - **No rebuild of any size has been opened by Outlook**, large ones included. There is no
   Outlook on the machine this was written on. libpff opens them and every block in them
   re-reads and re-checksums, which is evidence, but it is not that claim.
+- **Converting an OST to a PST needs blocks re-split, not just re-encoded.** Measured
+  rather than assumed, and the answer was worse than hoped. The 4K-page format allows a
+  block far bigger than the 512-page format's 8176-byte ceiling — libpff puts it at 65536
+  and the 16MB OST fixture bears that out, with two of its 442 blocks inflating from zlib
+  to 46,397 bytes. So a conversion cannot copy those across: each has to be split into
+  8176-byte data blocks with an XBLOCK built over them, and every reference to the
+  original patched — including references from inside subnode blocks, which are
+  themselves blocks holding ids. That is what makes it a format conversion rather than a
+  repair, and it is milestone 12 rather than a footnote. The check for it already exists:
+  libpff can read the source OST and the converted PST, and the 202 properties across its
+  three messages have to match id for id.
 - **Encrypted OST.** Per MS-PST the encoding modes are keyless, but Microsoft 365 profiles
   can restrict a local cache in ways this repo hasn't tested. Needs a real sample.
 - **A node whose every surviving index entry is stale still recovers as an older
