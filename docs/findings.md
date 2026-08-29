@@ -57,6 +57,12 @@ promised.
   OST is full of them — 40 of type `0x14` and 39 of `0x15` in a file with 40 folders, so
   roughly one of each per folder. Best guess is the sync engine's per-folder state, which
   would be OST-only. Currently labelled as undocumented rather than guessed at.
+- **Where FMap and FPMap pages actually recur is still not known**, and a rebuild now
+  works around that rather than answering it — see below. Settling it needs a PST over
+  125MB written by Outlook, which is the one thing no public corpus has.
+- **No rebuild of any size has been opened by Outlook**, large ones included. There is no
+  Outlook on the machine this was written on. libpff opens them and every block in them
+  re-reads and re-checksums, which is evidence, but it is not that claim.
 - **Encrypted OST.** Per MS-PST the encoding modes are keyless, but Microsoft 365 profiles
   can restrict a local cache in ways this repo hasn't tested. Needs a real sample.
 - **A node whose every surviving index entry is stale still recovers as an older
@@ -70,6 +76,31 @@ promised.
   be crying wolf over a healthy file.
 
 ## Resolved along the way
+
+- **The 32MB rebuild ceiling was a specification gap, and it did not need closing.** A PST
+  reserves fixed slots for four kinds of allocation map page, and a rebuild that put a
+  block in one would have Outlook write the map over it. MS-PST states where AMap and PMap
+  pages go. For FMap and FPMap it gives the coverage of a page (about 125MB, about 8GB) and
+  of the header's own copies (32MB, 2GB) — which pin the first of each and leave the
+  recurrence to a figure. Reading a recurrence off a picture is how a repair tool destroys
+  a block, so the ceiling stood.
+
+  It turned out the interval never had to be known. The figure shows all four maps in a
+  fixed order, at the head of an AMap section and nowhere else, so all four slots are now
+  kept clear at the head of *every* section. That is a superset of any reading of the
+  figure and costs 2KB in every 248KB — 0.8%. Being wrong about an interval is now merely
+  wasteful. The other half was that the whole file was assembled in a `Vec` before being
+  written, which a 40GB mailbox does not fit in; it is a single forward pass now, holding
+  one block at a time. Checked at 41MB across 171 AMap sections: every slot still empty,
+  every block re-read against its own checksum, and libpff reads the mail back out.
+
+- **Both sweeps were doing one read call per step, and one of the steps is 64 bytes.**
+  Carving tests every aligned boundary in the file for a block trailer — 600 million of
+  them on a 40GB file, each formerly a seek and a read. They read a megabyte at a time now
+  and work out of the buffer, which also removes the second read carving used to make in order to
+  checksum a candidate. On a 400MB file: 14 seconds to 0.4. The other half of that win was
+  a bound MS-PST supplies and the code was not using — a block is at most 8KB — so a
+  trailer made of random bytes can no longer ask for a 64KB checksum before being rejected.
 
 - **The sweep can be checked against ground truth, and it was wrong.** An undamaged file
   carries both the authoritative index *and* the freed pages the sweep reads, so the sweep

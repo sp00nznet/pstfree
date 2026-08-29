@@ -19,8 +19,9 @@ Updated as things land. Nothing is claimed until it runs.
 | 4c | Export to `.mbox` and `.msg` | ✅ done |
 | 8 | The window | ✅ done |
 | 9 | `--rebuild` — write the damage back out as a clean `.pst` | ✅ done — Unicode PST, under 32MB |
+| 10 | Rebuild a mailbox-sized PST: no size ceiling, and a sweep that finishes | ✅ done — verified at 41MB |
 
-45 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
+47 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
 the public fixtures from freepst, fetched by `tests\fetch-fixtures.ps1`. Test files are
 not committed, because real PSTs contain real mail; the tests skip rather than fail when
 they are absent.

@@ -23,9 +23,22 @@ use std::io::Write;
 /// MS-PST 1.3.2.4, and the reason a rebuild cannot simply lay blocks end to end.
 const AMAP_FIRST: u64 = 0x4400;
 const AMAP_EVERY: u64 = 253_952;
-/// A PMap every eighth AMap, immediately after the first one. MS-PST 1.3.2.5.
-const PMAP_FIRST: u64 = AMAP_FIRST + 512;
-const PMAP_EVERY: u64 = AMAP_EVERY * 8;
+
+/// How many 512-byte slots at the head of an AMap section are left to the map pages.
+///
+/// There are exactly four kinds of map — AMap, PMap, FMap, FPMap — and MS-PST's figure 3
+/// draws them in that order, each one immediately after the last, always at the start of
+/// an AMap section and nowhere else. How *often* the last two recur is the part the
+/// specification only draws: the prose gives the coverage of a page (an FMap ~125MB, an
+/// FPMap ~8GB) and of the header's own copies (32MB and 2GB), which pin the first of each
+/// but not a clean interval, and a rebuild that guessed wrong would have Outlook write a
+/// map straight over a block.
+///
+/// So it does not guess. All four slots are kept clear at the head of every section,
+/// which is a superset of any reading of that figure and costs 2KB in every 248KB — 0.8%
+/// of the file, against the alternative of refusing to rebuild anything over 32MB at all.
+/// Being wrong about an interval is now merely wasteful instead of destructive.
+const MAP_SLOTS: u64 = 4;
 
 const PAGE: u64 = 512;
 /// Blocks are allocated on 64-byte boundaries in the 512-byte-page format.
@@ -44,12 +57,6 @@ const PTYPE_NBT: u8 = 0x81;
 // good enough reason to name them rather than trust a mental picture of the layout.
 const OFF_BID_NEXT_P: usize = 32;
 const OFF_BID_NEXT_B: usize = 516;
-
-/// The header's own FMap and FPMap cover the first 32MB and the first 2GB. Past 32MB a
-/// file needs FMap *pages*, whose positions MS-PST gives only in a diagram — and a
-/// rebuild that guessed them would have Outlook write a map over live data the first time
-/// it allocated. Refused rather than guessed.
-const MAX_REBUILD: u64 = 32 << 20;
 
 pub struct Rebuilt {
     pub nodes: usize,
@@ -94,8 +101,12 @@ fn put64(b: &mut [u8], at: usize, v: u64) {
 /// are Outlook's business. Their *space* is this code's business — a rebuild writes them
 /// wherever the formula says, and anything living there would be overwritten.
 fn reserved(at: u64) -> bool {
-    (at >= AMAP_FIRST && (at - AMAP_FIRST).is_multiple_of(AMAP_EVERY))
-        || (at >= PMAP_FIRST && (at - PMAP_FIRST).is_multiple_of(PMAP_EVERY))
+    at >= AMAP_FIRST && (at - AMAP_FIRST) % AMAP_EVERY < MAP_SLOTS * PAGE
+}
+
+/// What a block occupies on disk: its data, the padding to 64 bytes, and the trailer.
+fn block_span(cb: u16) -> u64 {
+    (cb as u64 + 16).div_ceil(BLOCK_ALIGN) * BLOCK_ALIGN
 }
 
 /// The next offset at or after `at`, aligned, whose whole span clears the map slots.
@@ -225,12 +236,15 @@ pub fn rebuild(
     }
 
     // Blocks first: a node is only worth keeping if the block holding its data survived.
-    let mut kept: Vec<(Block, Vec<u8>)> = Vec::new();
+    // Only which blocks survived is remembered here, not their bytes — the file being
+    // rebuilt can be tens of gigabytes, and it is read a second time to write them out.
+    let mut kept: Vec<Block> = Vec::new();
     let mut dropped_blocks = 0;
     for b in blocks {
-        match pst.raw_block(b) {
-            Ok(bytes) if pst.block_intact(b) => kept.push((*b, bytes)),
-            _ => dropped_blocks += 1,
+        if pst.block_intact(b) {
+            kept.push(*b);
+        } else {
+            dropped_blocks += 1;
         }
     }
     if kept.is_empty() {
@@ -238,23 +252,15 @@ pub fn rebuild(
             "no block survived well enough to copy — there is nothing to rebuild from".into(),
         );
     }
-    kept.sort_by_key(|(b, _)| b.bid & !1);
+    kept.sort_by_key(|b| b.bid & !1);
 
-    let mut next = AMAP_FIRST + PAGE;
+    let mut next = AMAP_FIRST + MAP_SLOTS * PAGE;
     let mut placed: Vec<(Block, u64)> = Vec::new();
-    let mut body: Vec<(u64, Vec<u8>)> = Vec::new();
 
-    for (b, mut bytes) in kept {
-        let at = place_aligned(next, bytes.len() as u64, BLOCK_ALIGN);
-        next = at + bytes.len() as u64;
-
-        // The one field a move invalidates. Length, CRC and id all describe bytes that
-        // were copied unchanged, so they are carried across as they were.
-        let t = bytes.len() - 16;
-        put16(&mut bytes, t + 2, sig(at, b.bid));
-
+    for b in kept {
+        let at = place_aligned(next, block_span(b.cb), BLOCK_ALIGN);
+        next = at + block_span(b.cb);
         placed.push((b, at));
-        body.push((at, bytes));
     }
 
     let known: std::collections::HashSet<u64> = placed.iter().map(|(b, _)| b.bid & !1).collect();
@@ -314,13 +320,6 @@ pub fn rebuild(
         build_tree(bbt, BBTENTRY, PTYPE_BBT, &mut next, &mut next_bid);
 
     let eof = next.div_ceil(BLOCK_ALIGN) * BLOCK_ALIGN;
-    if eof > MAX_REBUILD {
-        return Err(format!(
-            "the rebuilt file would be {eof} bytes. Past 32MB a PST needs Free Map pages \
-             whose positions MS-PST only draws rather than states, and writing one at a \
-             guess would have Outlook overwrite live data. Use --export for a file this big."
-        ));
-    }
 
     let mut header = pst.header_bytes()?;
     // Everything the rebuild moved or invalidated. The rest of the header is the original
@@ -344,17 +343,16 @@ pub fn rebuild(
     let full = crc32(&header[8..8 + 516]);
     put32(&mut header, 524, full);
 
-    // Lay the whole thing out in memory and write once. Capped at 32MB above, so this is
-    // bounded — and a torn write during a repair is the one failure nobody would forgive.
-    let mut file = vec![0u8; eof as usize];
-    file[..header.len()].copy_from_slice(&header);
-    for (at, bytes) in body.iter().chain(nbt_pages.iter()).chain(bbt_pages.iter()) {
-        let at = *at as usize;
-        file[at..at + bytes.len()].copy_from_slice(bytes);
+    // Everything was placed at a rising offset, so the file can be written straight
+    // through: header, blocks, then the two trees, with the gaps zero-filled as they come.
+    // Streaming rather than assembling it in memory is what lets the size cap go — a 40GB
+    // mailbox is a normal thing to be handed and is not going to fit in a Vec.
+    if let Err(e) = write_out(pst, &header, &placed, &nbt_pages, &bbt_pages, eof, out) {
+        // A half-written repair looks like a repair. It is a fresh file, so the damaged
+        // original is untouched either way, but nobody should be left holding this one.
+        let _ = std::fs::remove_file(out);
+        return Err(e);
     }
-
-    let mut f = std::fs::File::create(out).map_err(|e| format!("{out}: {e}"))?;
-    f.write_all(&file).map_err(|e| format!("{out}: {e}"))?;
 
     Ok(Rebuilt {
         nodes: keep.len(),
@@ -364,6 +362,62 @@ pub fn rebuild(
         missing,
         bytes: eof,
     })
+}
+
+/// Write the laid-out file in one forward pass, re-reading each block from the source.
+///
+/// `placed` and the tree pages are already in rising offset order, so this never seeks:
+/// it pads to the next offset with zeroes and writes. The gaps are an alignment remainder
+/// or a map slot group, never more than a couple of kilobytes.
+fn write_out(
+    pst: &mut Pst,
+    header: &[u8],
+    placed: &[(Block, u64)],
+    nbt_pages: &[(u64, Vec<u8>)],
+    bbt_pages: &[(u64, Vec<u8>)],
+    eof: u64,
+    out: &str,
+) -> Result<(), String> {
+    let f = std::fs::File::create(out).map_err(|e| format!("{out}: {e}"))?;
+    let mut f = std::io::BufWriter::with_capacity(1 << 20, f);
+    let mut pos = 0u64;
+    let io = |e: std::io::Error| format!("{out}: {e}");
+
+    f.write_all(header).map_err(io)?;
+    pos += header.len() as u64;
+
+    for (b, at) in placed {
+        pad(&mut f, &mut pos, *at).map_err(io)?;
+        let mut bytes = pst.raw_block(b)?;
+        // The one field a move invalidates. Length, CRC and id all describe bytes that
+        // were copied unchanged, so they are carried across as they were.
+        let t = bytes.len() - 16;
+        put16(&mut bytes, t + 2, sig(*at, b.bid));
+        f.write_all(&bytes).map_err(io)?;
+        pos += bytes.len() as u64;
+    }
+
+    for (at, page) in nbt_pages.iter().chain(bbt_pages.iter()) {
+        pad(&mut f, &mut pos, *at).map_err(io)?;
+        f.write_all(page).map_err(io)?;
+        pos += page.len() as u64;
+    }
+    pad(&mut f, &mut pos, eof).map_err(io)?;
+    f.flush().map_err(io)
+}
+
+/// Zero-fill forward to `to`. Nothing is ever placed behind the cursor, so this only ever
+/// moves forward; `saturating_sub` is there so a bug could not turn into a hang.
+fn pad(f: &mut impl Write, pos: &mut u64, to: u64) -> std::io::Result<()> {
+    const ZEROS: [u8; 4096] = [0; 4096];
+    let mut left = to.saturating_sub(*pos);
+    *pos += left;
+    while left > 0 {
+        let n = left.min(ZEROS.len() as u64) as usize;
+        f.write_all(&ZEROS[..n])?;
+        left -= n as u64;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -433,20 +487,135 @@ mod tests {
         let _ = std::fs::remove_file(out);
     }
 
+    /// A rebuild big enough to actually meet the map pages, which no fixture is.
+    ///
+    /// `dist-list.pst` rebuilds to about 110KB — under half of one AMap section, so
+    /// nothing in it ever reaches a map slot, and until this the writer had never had to
+    /// step over one. Blocks are appended to the fixture until the rebuild spans several
+    /// sections. They belong to no index, which is the point: carving reads blocks out of
+    /// the file itself, so every one of them lands in the result.
+    #[test]
+    fn a_rebuild_that_crosses_the_map_pages() {
+        let src = "tests/data/dist-list.pst";
+        if !std::path::Path::new(src).exists() {
+            eprintln!("skipping: run tests/fetch-fixtures.ps1");
+            return;
+        }
+        let mut file = std::fs::read(src).expect("fixture should read");
+        assert!(
+            (file.len() as u64).is_multiple_of(BLOCK_ALIGN),
+            "the fixture ends aligned"
+        );
+
+        // The largest a block's data may be: MS-PST 2.2.2.8 caps the whole thing at 8KB.
+        const CB: usize = 8176;
+        let mut bid =
+            u64::from_le_bytes(file[OFF_BID_NEXT_B..OFF_BID_NEXT_B + 8].try_into().unwrap()).max(4)
+                + 4;
+        for i in 0..180u64 {
+            let at = file.len() as u64;
+            let mut b = vec![0u8; CB + 16];
+            for (j, c) in b[..CB].iter_mut().enumerate() {
+                *c = (i as usize + j) as u8;
+            }
+            let crc = crc32(&b[..CB]);
+            put16(&mut b, CB, CB as u16);
+            put16(&mut b, CB + 2, sig(at, bid));
+            put32(&mut b, CB + 4, crc);
+            put64(&mut b, CB + 8, bid);
+            file.extend_from_slice(&b);
+            bid += 4;
+        }
+
+        let big = std::env::temp_dir().join("pstfree-rebuild-big.pst");
+        std::fs::write(&big, &file).expect("temp file should write");
+        let big = big.to_str().unwrap();
+        let mut pst = Pst::open(big).expect("the padded fixture should still open");
+        let nodes = pst.nodes();
+        let blocks = pst.carve();
+        assert!(
+            blocks.len() > 180,
+            "carving should find the appended blocks"
+        );
+
+        let out = std::env::temp_dir().join("pstfree-rebuild-big-out.pst");
+        let out = out.to_str().unwrap();
+        let r = rebuild(&mut pst, &nodes, &blocks, out).expect("rebuild should succeed");
+        assert!(r.missing.is_empty(), "rebuilt without {:?}", r.missing);
+        assert!(
+            r.bytes > AMAP_FIRST + AMAP_EVERY,
+            "{} bytes never reaches the second AMap, so this proves nothing",
+            r.bytes
+        );
+
+        // The whole point of the exercise: every slot a map page could claim is still
+        // empty, in every section of the file.
+        let written = std::fs::read(out).expect("the rebuild should read back");
+        let mut at = AMAP_FIRST;
+        while at + MAP_SLOTS * PAGE <= written.len() as u64 {
+            let slots = &written[at as usize..(at + MAP_SLOTS * PAGE) as usize];
+            assert!(
+                slots.iter().all(|b| *b == 0),
+                "something was written into the map slots at 0x{at:X}"
+            );
+            at += AMAP_EVERY;
+        }
+
+        let mut back = Pst::open(out).expect("a rebuilt file should open");
+        assert_eq!(back.blocks().len(), r.blocks, "block count changed");
+        for b in &back.blocks() {
+            back.block(b.bid)
+                .unwrap_or_else(|e| panic!("block {} unreadable after rebuild: {e}", b.bid));
+        }
+        let _ = std::fs::remove_file(big);
+        let _ = std::fs::remove_file(out);
+    }
+
+    /// The layout, run out past the old 32MB ceiling and well past 2GB.
+    ///
+    /// No fixture is anywhere near this big and there is no public one that is, so the
+    /// placement is exercised on its own: the same loop `rebuild` runs, over blocks of
+    /// every legal size, checked for the three things that would corrupt a file — a block
+    /// sitting on a map slot, two blocks overlapping, or an offset going backwards, which
+    /// would break the single forward pass the writer makes.
+    #[test]
+    fn placement_holds_over_three_gigabytes() {
+        let mut next = AMAP_FIRST + MAP_SLOTS * PAGE;
+        let mut end = next;
+        let mut sizes = (64u32..=8192).step_by(64).cycle();
+
+        while next < 3 << 30 {
+            let len = block_span(sizes.next().unwrap() as u16 - 16);
+            let at = place_aligned(next, len, BLOCK_ALIGN);
+            assert!(
+                at >= end,
+                "{at} was placed behind the block ending at {end}"
+            );
+            assert!(at.is_multiple_of(BLOCK_ALIGN), "{at} is not 64-aligned");
+            for page in at / PAGE..=(at + len - 1) / PAGE {
+                assert!(!reserved(page * PAGE), "a block at {at} covers a map slot");
+            }
+            next = at + len;
+            end = next;
+        }
+    }
+
     #[test]
     fn a_map_slot_never_gets_a_block() {
-        // The first AMap, the first PMap, and the AMap one interval along.
-        for slot in [AMAP_FIRST, PMAP_FIRST, AMAP_FIRST + AMAP_EVERY] {
-            assert!(reserved(slot), "0x{slot:X} should be spoken for");
-            let at = place_aligned(slot - 64, 512, BLOCK_ALIGN);
-            assert!(
-                at >= slot + PAGE || at + 512 <= slot,
-                "a block at {at} runs through the map page at {slot}"
-            );
+        // All four slots of the first section, of the next one, and of a section 40GB in
+        // — the size this used to refuse outright, where an FMap and an FPMap can land.
+        for section in [0, AMAP_EVERY, AMAP_EVERY * 165_000] {
+            for slot in 0..MAP_SLOTS {
+                let at = AMAP_FIRST + section + slot * PAGE;
+                assert!(reserved(at), "0x{at:X} should be spoken for");
+                let put = place_aligned(at - 64, 512, BLOCK_ALIGN);
+                assert!(
+                    put >= at + PAGE || put + 512 <= at,
+                    "a block at {put} runs through the map page at {at}"
+                );
+            }
+            let free = AMAP_FIRST + section + MAP_SLOTS * PAGE;
+            assert!(!reserved(free), "0x{free:X} is ordinary space");
         }
-        assert!(
-            !reserved(AMAP_FIRST + PAGE * 3),
-            "ordinary space is not reserved"
-        );
     }
 }

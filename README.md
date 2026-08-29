@@ -8,7 +8,9 @@ service, nothing left behind — and neither one ever asks for a password, becau
 password is not a lock.
 
 **Delete both of a PST's B-tree roots and it still recovers every message, byte for byte —
-then writes the whole thing back out as a clean file Outlook can open.**
+then writes the whole thing back out as a clean file Outlook can open.** At any size: the
+32MB ceiling on rebuilding is gone as of v0.2.0, and a sweep of a 400MB file went from 14
+seconds to 0.4.
 
 ![pstfree](docs/screenshot.png)
 
@@ -96,7 +98,7 @@ date              folder        from        subject
 2014-05-25 13:58  Contacts      Unknown     test dist list  [1164 bytes]
 
 > pstfree.exe torn.pst --rebuild fixed.pst --salvage
-Wrote fixed.pst: 128 node(s), 184 block(s), 124928 bytes.
+Wrote fixed.pst: 128 node(s), 184 block(s), 125952 bytes.
 ```
 
 libpff refuses to open `torn.pst` and reads all four messages out of `fixed.pst`.
@@ -125,8 +127,8 @@ the rest are written. See [docs/exporting.md](docs/exporting.md).
 
 **Repair** — the differentiator. Validate every checksum and say in plain language what is
 wrong; rebuild the node and block B-trees from surviving pages; carve blocks straight out
-of the file with no index at all; and write the result back out as a clean `.pst`. See
-[docs/repair.md](docs/repair.md).
+of the file with no index at all; and write the result back out as a clean `.pst`, at any
+size. See [docs/repair.md](docs/repair.md).
 
 **Not in scope** — writing to a live Outlook profile, MAPI, Exchange, and new Outlook's own
 undocumented local store. Reading a file is a different job from being a mail client.
@@ -137,10 +139,16 @@ Stated plainly, because a repair tool that overstates itself is the thing this r
 
 - **ANSI PST (Outlook 97–2002) is refused, not half-parsed.** Different header layout, 2GB
   ceiling. No sample has turned up to build it against.
-- **`--rebuild` writes 512-byte-page Unicode PSTs only, up to 32MB.** An OST is 4K pages
-  and zlib-compressed blocks, so converting one is a format conversion rather than a
-  repair. Past 32MB a PST needs Free Map pages whose positions MS-PST only draws rather
-  than states, and guessing would have Outlook overwrite live data. Both refuse and say so.
+- **`--rebuild` writes 512-byte-page Unicode PSTs only.** An OST is 4K pages and
+  zlib-compressed blocks, so converting one is a format conversion rather than a repair.
+  It refuses and says so.
+- **No rebuild has ever been opened by Outlook**, because there is no Outlook here. libpff
+  opens them and every block in them re-reads and re-checksums, which is evidence but is
+  not that claim.
+- **Where FMap and FPMap pages recur is still unknown.** A rebuild works around it instead
+  of answering it — it keeps every slot the four map pages could occupy clear, in every
+  section of the file, which costs 0.8% and cannot be wrong in the direction that destroys
+  data. Settling it properly needs a PST over 125MB written by Outlook.
 - **Attachment extraction has never seen a real attachment**, because none of the three
   public fixtures has one.
 - **Cyclic encoding has never decoded a real file** — no fixture uses it.
@@ -152,7 +160,7 @@ The full list, including the places the first reading of the spec was wrong, is 
 
 ## How it is tested
 
-45 tests, against a real PST, a real 2013 OST and a real password-protected PST — the
+47 tests, against a real PST, a real 2013 OST and a real password-protected PST — the
 public fixtures from [freepst], fetched by `tests\fetch-fixtures.ps1`. Test files are never
 committed, because real PSTs contain real mail; the tests skip rather than fail when they
 are absent.

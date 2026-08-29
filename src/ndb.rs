@@ -264,6 +264,10 @@ pub fn nid_type_name(t: u8) -> &'static str {
     }
 }
 
+/// How much of the file a sweep pulls in at once. Both sweeps walk the whole file in
+/// small fixed steps, and the step is far too small to be a read call.
+const SWEEP_WINDOW: usize = 1 << 20;
+
 pub struct Pst {
     file: File,
     page: Layout,
@@ -780,62 +784,70 @@ impl Pst {
 
         let step = self.page.size;
         let (t, f) = (self.page.trailer, self.page.footer);
-        let mut buf = vec![0u8; step as usize];
+        // A window at a time rather than a page at a time. The pages are contiguous, so
+        // this is the same bytes in the same order - but a 40GB file is 80 million pages,
+        // and one read call each is the difference between minutes and an afternoon.
+        let mut win = vec![0u8; SWEEP_WINDOW];
         let mut ib = step; // offset 0 is the header, never a page
 
         while ib + step <= self.actual_len {
-            r.pages_scanned += 1;
+            let len = (SWEEP_WINDOW as u64).min(self.actual_len - ib) / step * step;
             if self.file.seek(SeekFrom::Start(ib)).is_err()
-                || self.file.read_exact(&mut buf).is_err()
+                || self.file.read_exact(&mut win[..len as usize]).is_err()
             {
                 break;
             }
-            ib += step;
+            let base = ib;
+            ib += len;
 
-            let ptype = buf[t];
-            if ptype != buf[t + 1] || (ptype != PTYPE_NBT && ptype != PTYPE_BBT) {
-                continue;
-            }
-            // The checksum is what makes this safe: without it, any 512 bytes that
-            // happened to hold two equal bytes in the right place would be "a page".
-            if crc32(&buf[..t]) != u32le(&buf, t + 4) {
-                r.damaged_pages += 1;
-                continue;
-            }
+            for at in (base..base + len).step_by(step as usize) {
+                let buf = &win[(at - base) as usize..(at - base + step) as usize];
+                r.pages_scanned += 1;
 
-            let (count, size, level) = if self.page.wide_counts {
-                (u16le(&buf, f) as usize, buf[f + 4] as usize, buf[f + 5])
-            } else {
-                (buf[f] as usize, buf[f + 2] as usize, buf[f + 3])
-            };
-            if level != 0 || size == 0 || count * size > f {
-                continue;
-            }
-            let at = ib - step;
-
-            if ptype == PTYPE_NBT {
-                r.nbt_pages += 1;
-                for i in 0..count {
-                    let e = &buf[i * size..i * size + size];
-                    let n = Node {
-                        nid: u32le(e, 0),
-                        bid_data: u64le(e, 8),
-                        bid_sub: u64le(e, 16),
-                        nid_parent: u32le(e, 24),
-                    };
-                    nodes.entry(n.nid).or_default().push((at, n));
+                let ptype = buf[t];
+                if ptype != buf[t + 1] || (ptype != PTYPE_NBT && ptype != PTYPE_BBT) {
+                    continue;
                 }
-            } else {
-                r.bbt_pages += 1;
-                for i in 0..count {
-                    let e = &buf[i * size..i * size + size];
-                    let b = Block {
-                        bid: u64le(e, 0),
-                        ib: u64le(e, 8),
-                        cb: u16le(e, 16),
-                        cref: u16le(e, 18),
-                    };
-                    blocks.entry(b.bid & !1).or_default().push((at, b));
+                // The checksum is what makes this safe: without it, any 512 bytes that
+                // happened to hold two equal bytes in the right place would be "a page".
+                if crc32(&buf[..t]) != u32le(buf, t + 4) {
+                    r.damaged_pages += 1;
+                    continue;
+                }
+
+                let (count, size, level) = if self.page.wide_counts {
+                    (u16le(buf, f) as usize, buf[f + 4] as usize, buf[f + 5])
+                } else {
+                    (buf[f] as usize, buf[f + 2] as usize, buf[f + 3])
+                };
+                if level != 0 || size == 0 || count * size > f {
+                    continue;
+                }
+
+                if ptype == PTYPE_NBT {
+                    r.nbt_pages += 1;
+                    for i in 0..count {
+                        let e = &buf[i * size..i * size + size];
+                        let n = Node {
+                            nid: u32le(e, 0),
+                            bid_data: u64le(e, 8),
+                            bid_sub: u64le(e, 16),
+                            nid_parent: u32le(e, 24),
+                        };
+                        nodes.entry(n.nid).or_default().push((at, n));
+                    }
+                } else {
+                    r.bbt_pages += 1;
+                    for i in 0..count {
+                        let e = &buf[i * size..i * size + size];
+                        let b = Block {
+                            bid: u64le(e, 0),
+                            ib: u64le(e, 8),
+                            cb: u16le(e, 16),
+                            cref: u16le(e, 18),
+                        };
+                        blocks.entry(b.bid & !1).or_default().push((at, b));
+                    }
                 }
             }
         }
@@ -939,34 +951,47 @@ impl Pst {
         // the two, and the file grows forwards.
         let mut found: HashMap<u64, Block> = HashMap::new();
 
-        let mut buf = Vec::new();
-        let mut trailer = [0u8; 24];
-        let trailer_len = (back as usize).min(trailer.len());
+        // MS-PST 2.2.2.8: a block is 8KB at the very most, trailer included. libpff has
+        // seen 4K-page files scale that with the page, so the ceiling is derived from the
+        // alignment rather than fixed at 8176 - it does not have to be exact, only tight
+        // enough that a trailer made of random bytes stops asking for a 64KB checksum.
+        let max_cb = align * 128 - back;
+
+        // Every aligned boundary in the file is a candidate, so this cannot afford a read
+        // call per candidate: at 64-byte alignment a 40GB file has 600 million of them.
+        // It reads a window instead, wide enough that the longest block a trailer could
+        // claim still starts inside the same window and can be checksummed from it.
+        let carry = align * 128;
+        let span = (carry + SWEEP_WINDOW as u64) as usize;
+        let mut win = vec![0u8; span];
+        let mut base = 0u64;
+        let mut len = 0u64;
 
         // Every candidate is a block *end*: an aligned boundary with a trailer just
         // before it. The trailer's own length field then says where the block began.
         let mut end = align;
         while end <= self.actual_len {
-            let t = end - back;
-            let ok = self.file.seek(SeekFrom::Start(t)).is_ok()
-                && self.file.read_exact(&mut trailer[..trailer_len]).is_ok();
-            if !ok {
-                break;
+            if end > base + len {
+                base = end.saturating_sub(carry);
+                len = (span as u64).min(self.actual_len - base);
+                if self.file.seek(SeekFrom::Start(base)).is_err()
+                    || self.file.read_exact(&mut win[..len as usize]).is_err()
+                {
+                    break;
+                }
             }
-            let cb = u16le(&trailer, 0) as u64;
-            let bid = u64le(&trailer, 8);
+            let trailer = &win[(end - back - base) as usize..(end - base) as usize];
+            let cb = u16le(trailer, 0) as u64;
+            let bid = u64le(trailer, 8);
             let total = (cb + back).div_ceil(align) * align;
 
             // A block of this length, ending here, must start at or after the file start,
             // and must be padded to exactly this boundary - otherwise the trailer belongs
             // to something else and these bytes only look like one.
-            if cb > 0 && bid > 0 && total <= end {
+            if cb > 0 && cb <= max_cb && bid > 0 && total <= end {
                 let begin = end - total;
-                buf.resize(cb as usize, 0);
-                if self.file.seek(SeekFrom::Start(begin)).is_ok()
-                    && self.file.read_exact(&mut buf).is_ok()
-                    && crc32(&buf) == u32le(&trailer, 4)
-                {
+                let at = (begin - base) as usize;
+                if crc32(&win[at..at + cb as usize]) == u32le(trailer, 4) {
                     found.insert(
                         bid & !1,
                         Block {

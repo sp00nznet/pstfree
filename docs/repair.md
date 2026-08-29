@@ -115,8 +115,40 @@ silently later:
 This file will NOT open: it has no message store (node 0x21).
 ```
 
-Two things it refuses outright rather than half-doing. An **OST** is 4K pages and
+One thing it refuses outright rather than half-doing. An **OST** is 4K pages and
 zlib-compressed blocks, so turning one into a PST is a format conversion and not a repair.
-And a rebuild over **32MB** would need Free Map pages, whose positions MS-PST gives only in
-a diagram — writing one at a guess would have Outlook overwrite live data the first time it
-allocated. Both say so and point at `--export`.
+It says so and points at `--export`.
+
+## Any size
+
+There used to be a second refusal, at 32MB, and it was the more painful one: the size at
+which a PST stops being a test file and starts being somebody's mailbox.
+
+Two things put it there. The first was that the whole rebuilt file was assembled in memory
+before being written, which is fine for 32MB and absurd for 40GB. That is now a single
+forward pass — the header, then the blocks in the order they were placed, then the two
+trees — re-reading each block off the source as it goes and zero-filling the gaps. Nothing
+larger than one block is ever held.
+
+The second was the allocation maps. A PST reserves fixed slots through the file for four
+kinds of map page, and a rebuild must not put a block where one goes, or Outlook writes the
+map straight over it. MS-PST states where **AMap** and **PMap** pages land, in prose. For
+**FMap** and **FPMap** it gives the coverage of a page — about 125MB and about 8GB — and of
+the header's built-in copies — 32MB and 2GB — and then draws the rest in a figure. Those
+numbers pin down the first of each and leave the recurrence to be inferred from a picture,
+which is exactly the kind of guess that ends with a map page landing on somebody's mail.
+
+So it is not inferred. Figure 3 shows all four appearing in a fixed order, always at the
+head of an AMap section and nowhere else, so **all four slots are kept clear at the head of
+every section** — 2KB in every 248KB, or 0.8% of the file. That is a superset of every
+reading of the figure. Being wrong about an interval now wastes half a kilobyte instead of
+destroying a block, and the ceiling has nothing left to hold it up.
+
+The sweeps had to keep up too. Carving tests every 64-byte boundary in the file, and one
+read call each is 600 million of them on a 40GB file; both sweeps now read a megabyte at a
+time and work out of the buffer. On a 400MB file that took a sweep from 14 seconds to 0.4.
+
+Checked rather than asserted: a 40MB file of blocks that no index mentions, carved and
+rebuilt into a **41MB PST across 171 AMap sections** — every map slot in all 171 still
+empty, every block re-read and matched against its own checksum, and the result opened by
+libpff, which reads the mail back out of it.
