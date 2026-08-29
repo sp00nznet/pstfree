@@ -16,7 +16,7 @@ use pstfree::ltp::{
     clean_subject, filetime, read_node_pc, NID_ROOT_FOLDER, PID_DELIVERY_TIME, PID_DISPLAY_NAME,
     PID_SENDER_NAME, PID_SUBJECT, PID_SUBMIT_TIME, PID_TRANSPORT_HEADERS,
 };
-use pstfree::ndb::{Node, Pst};
+use pstfree::ndb::{Block, Node, Pst};
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, WPARAM};
@@ -34,7 +34,35 @@ const ID_OPEN: usize = 100;
 const ID_EXPORT_EML: usize = 101;
 const ID_EXPORT_MBOX: usize = 102;
 const ID_EXPORT_MSG: usize = 103;
-const ID_QUIT: usize = 104;
+const ID_REBUILD: usize = 104;
+const ID_REPORT: usize = 105;
+const ID_QUIT: usize = 106;
+
+/// The version, so a downloaded .exe with no installer behind it can still say what it
+/// is. It goes in the title bar, which is the only place a window can put it and be sure
+/// somebody reading a bug report can find it.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// A long job posts these back; both carry a boxed `String` the handler takes ownership
+/// of. Posting is the one thing Windows lets another thread do to a window, so the job
+/// runs off the message loop and the window keeps painting while it does.
+const WM_JOB_PROGRESS: u32 = WM_APP + 1;
+const WM_JOB_DONE: u32 = WM_APP + 2;
+
+/// A window handle to post to from the worker. `PostMessageW` is documented as safe to
+/// call from any thread; nothing else here is done with it.
+#[derive(Clone, Copy)]
+struct Poster(HWND);
+unsafe impl Send for Poster {}
+
+impl Poster {
+    /// Hand the window a string and give up ownership of it; the handler takes it back.
+    /// Taken by value so the whole handle moves into a worker, rather than the raw
+    /// pointer inside it, which is the part that is not `Send`.
+    fn say(self, m: u32, text: String) {
+        unsafe { PostMessageW(self.0, m, 0, Box::into_raw(Box::new(text)) as LPARAM) };
+    }
+}
 
 /// Everything the window needs to answer a message. Boxed once and hung off the window.
 struct App {
@@ -49,6 +77,14 @@ struct App {
     list: HWND,
     text: HWND,
     status: HWND,
+    /// What was wrong with the file, kept so the report can be asked for again rather
+    /// than scrolling past once in the status bar.
+    problems: Vec<String>,
+    /// Whether the index had to be swept, which the report says out loud.
+    salvaged: bool,
+    /// A job is running on another thread. The menu items that would start a second one
+    /// are refused rather than greyed out, so the refusal can say why.
+    busy: bool,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -146,6 +182,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
+        // Both carry a String the worker boxed and gave up ownership of.
+        WM_JOB_PROGRESS => {
+            let text = *Box::from_raw(lp as *mut String);
+            set_status(hwnd, &text);
+            0
+        }
+        WM_JOB_DONE => {
+            let text = *Box::from_raw(lp as *mut String);
+            let app = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
+            if !app.is_null() {
+                (*app).busy = false;
+            }
+            set_status(hwnd, &text.replace('\n', " "));
+            message_box(hwnd, &text, "pstfree", MB_ICONINFORMATION);
+            0
+        }
         WM_DESTROY => {
             let app = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
             if !app.is_null() {
@@ -236,6 +288,9 @@ unsafe fn create_children(hwnd: HWND) {
         list,
         text,
         status,
+        problems: Vec::new(),
+        salvaged: false,
+        busy: false,
     });
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
 
@@ -247,6 +302,9 @@ unsafe fn create_children(hwnd: HWND) {
         (ID_EXPORT_EML, "Export all as &.eml..."),
         (ID_EXPORT_MBOX, "Export all as m&box..."),
         (ID_EXPORT_MSG, "Export all as .m&sg..."),
+        (0, ""),
+        (ID_REBUILD, "&Repair to a new .pst..."),
+        (ID_REPORT, "&What is wrong with this file"),
         (0, ""),
         (ID_QUIT, "E&xit"),
     ];
@@ -266,6 +324,8 @@ unsafe fn create_children(hwnd: HWND) {
         hwnd,
         "Open a .pst or .ost file to begin. No password is ever needed.",
     );
+    let title = wide(&format!("pstfree {VERSION}"));
+    SetWindowTextW(hwnd, title.as_ptr());
 }
 
 /// Left third for the folders, the rest split between the message list and the message.
@@ -312,6 +372,8 @@ unsafe fn command(hwnd: HWND, app: &mut App, id: usize) {
         ID_EXPORT_EML => do_export(hwnd, app, Format::Eml),
         ID_EXPORT_MBOX => do_export(hwnd, app, Format::Mbox),
         ID_EXPORT_MSG => do_export(hwnd, app, Format::Msg),
+        ID_REBUILD => do_rebuild(hwnd, app),
+        ID_REPORT => do_report(hwnd, app),
         ID_QUIT => {
             PostMessageW(hwnd, WM_CLOSE, 0, 0);
         }
@@ -343,6 +405,32 @@ unsafe fn pick_file(hwnd: HWND) -> Option<String> {
     (GetOpenFileNameW(&mut ofn) != 0).then(|| from_wide(&buf))
 }
 
+/// Where to write a repair. The same flat API as the open dialog, one flag apart.
+unsafe fn pick_save(hwnd: HWND) -> Option<String> {
+    use windows_sys::Win32::UI::Controls::Dialogs::{
+        GetSaveFileNameW, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+
+    let mut buf = [0u16; 1024];
+    let filter: Vec<u16> = "Outlook data file\0*.pst\0All files\0*.*\0\0"
+        .encode_utf16()
+        .collect();
+    let title = wide("Write the repaired copy as");
+    let ext = wide("pst");
+
+    let mut ofn: OPENFILENAMEW = std::mem::zeroed();
+    ofn.lStructSize = size_of::<OPENFILENAMEW>() as u32;
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFilter = filter.as_ptr();
+    ofn.lpstrFile = buf.as_mut_ptr();
+    ofn.nMaxFile = buf.len() as u32;
+    ofn.lpstrTitle = title.as_ptr();
+    ofn.lpstrDefExt = ext.as_ptr();
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+
+    (GetSaveFileNameW(&mut ofn) != 0).then(|| from_wide(&buf))
+}
+
 /// Pick a directory, using the folder-browser rather than the file dialog.
 unsafe fn pick_folder(hwnd: HWND) -> Option<String> {
     use windows_sys::Win32::UI::Shell::{
@@ -365,19 +453,13 @@ unsafe fn pick_folder(hwnd: HWND) -> Option<String> {
     ok.then(|| from_wide(&buf))
 }
 
-unsafe fn open_file(hwnd: HWND, app: &mut App, path: &str) {
-    set_status(hwnd, &format!("Reading {path}..."));
-    let mut pst = match Pst::open(path) {
-        Ok(p) => p,
-        Err(e) => {
-            message_box(hwnd, &e, "pstfree", MB_ICONERROR);
-            set_status(hwnd, "Nothing open.");
-            return;
-        }
-    };
-
-    // Same fallback the command line uses: a file whose index is gone is the one someone
-    // most wants opened, so it is rebuilt rather than refused.
+/// Open a file and get an index out of it, however that has to be done.
+///
+/// A file whose index is gone is the one someone most wants opened, so it is rebuilt by
+/// sweeping and carving rather than refused. Shared with the worker thread, which opens
+/// its own handle and has to arrive at exactly the same index the window is showing.
+fn load(path: &str) -> Result<(Pst, Vec<Node>, bool), String> {
+    let mut pst = Pst::open(path)?;
     let mut nodes = pst.nodes();
     let salvaged = nodes.is_empty() || pst.blocks().is_empty();
     if salvaged {
@@ -388,25 +470,65 @@ unsafe fn open_file(hwnd: HWND, app: &mut App, path: &str) {
             nodes = r.nodes;
         }
     }
+    Ok((pst, nodes, salvaged))
+}
 
-    // Folder names, then every message grouped under the folder that holds it.
+/// The blocks a rebuild should copy: whatever the index in use names.
+fn index_blocks(pst: &mut Pst) -> Vec<Block> {
+    let blocks = pst.blocks();
+    if blocks.is_empty() {
+        pst.carve()
+    } else {
+        blocks
+    }
+}
+
+/// A display name for every folder. Both the tree and an export need these, and they
+/// have to agree, or the folder called Inbox on screen is not the one on disk.
+fn folder_names(pst: &mut Pst, nodes: &[Node]) -> BTreeMap<u32, String> {
     let mut names = BTreeMap::new();
     for n in nodes.iter().filter(|n| n.nid_type() == 0x02) {
-        let name = read_node_pc(&mut pst, n)
+        let name = read_node_pc(pst, n)
             .ok()
             .and_then(|pc| pc.str(PID_DISPLAY_NAME).map(str::to_string))
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| {
                 if n.nid == NID_ROOT_FOLDER {
-                    path.rsplit(['\\', '/'])
-                        .next()
-                        .unwrap_or("(root)")
-                        .to_string()
+                    "(root)".into()
                 } else {
                     "(unnamed)".into()
                 }
             });
         names.insert(n.nid, name);
+    }
+    names
+}
+
+unsafe fn open_file(hwnd: HWND, app: &mut App, path: &str) {
+    set_status(hwnd, &format!("Reading {path}..."));
+    let (mut pst, nodes, salvaged) = match load(path) {
+        Ok(t) => t,
+        Err(e) => {
+            message_box(hwnd, &e, "pstfree", MB_ICONERROR);
+            set_status(hwnd, "Nothing open.");
+            return;
+        }
+    };
+
+    app.problems = pst.warnings.clone();
+    app.salvaged = salvaged;
+
+    // The root folder is the one place the file's own name reads better than the file's
+    // idea of the name, which is usually blank.
+    let mut names = folder_names(&mut pst, &nodes);
+    if let Some(root) = names.get_mut(&NID_ROOT_FOLDER) {
+        if root == "(root)" {
+            *root = path
+                .rsplit(['\\', '/'])
+                .next()
+                .unwrap_or("(root)")
+                .to_string();
+        }
     }
 
     let mut by_folder: BTreeMap<u32, Vec<(Node, String, String, String)>> = BTreeMap::new();
@@ -463,7 +585,7 @@ unsafe fn open_file(hwnd: HWND, app: &mut App, path: &str) {
         ),
     );
 
-    let title = wide(&format!("pstfree — {file}"));
+    let title = wide(&format!("pstfree {VERSION} — {file}"));
     SetWindowTextW(hwnd, title.as_ptr());
 }
 
@@ -646,12 +768,11 @@ unsafe fn show_message(app: &mut App, row: usize) {
 }
 
 unsafe fn do_export(hwnd: HWND, app: &mut App, format: Format) {
-    if app.pst.is_none() {
-        message_box(hwnd, "Open a file first.", "pstfree", MB_ICONINFORMATION);
+    if !ready(hwnd, app) {
         return;
     }
     let Some(dir) = pick_folder(hwnd) else { return };
-    let root = std::path::Path::new(&dir);
+    let root = std::path::PathBuf::from(&dir);
     if root.read_dir().is_ok_and(|mut d| d.next().is_some()) {
         message_box(
             hwnd,
@@ -662,39 +783,167 @@ unsafe fn do_export(hwnd: HWND, app: &mut App, format: Format) {
         return;
     }
 
-    set_status(hwnd, "Exporting...");
-    let pst = app.pst.as_mut().unwrap();
-    let mut names = BTreeMap::new();
-    for n in app.nodes.iter().filter(|n| n.nid_type() == 0x02) {
-        let name = read_node_pc(pst, n)
-            .ok()
-            .and_then(|pc| pc.str(PID_DISPLAY_NAME).map(str::to_string))
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| {
-                if n.nid == NID_ROOT_FOLDER {
-                    "(root)".into()
-                } else {
-                    "(unnamed)".into()
-                }
-            });
-        names.insert(n.nid, name);
+    spawn_job(hwnd, app, "Exporting", move |pst, nodes, on| {
+        let names = folder_names(pst, &nodes);
+        let st = export::export(pst, &nodes, &names, &root, format, on);
+        let mut msg = format!("{} message(s) written to {dir}", st.messages);
+        if st.attachments > 0 {
+            msg += &format!("\n{} attachment(s) included.", st.attachments);
+        }
+        if st.failed > 0 {
+            msg += &format!("\n{} could not be written.", st.failed);
+        }
+        msg
+    });
+}
+
+/// Write the open file back out as a clean PST. The thing the paid tools sell, and until
+/// now the one thing here that the command line could do and the window could not.
+unsafe fn do_rebuild(hwnd: HWND, app: &mut App) {
+    if !ready(hwnd, app) {
+        return;
+    }
+    if app.pst.as_ref().is_some_and(|p| !p.is_small_page()) {
+        message_box(
+            hwnd,
+            "This is a 4K-page file — an Outlook 2013 or later OST. Turning one into a PST \
+             is a format conversion rather than a repair, and is not written yet. Export \
+             the mail instead.",
+            "pstfree",
+            MB_ICONWARNING,
+        );
+        return;
+    }
+    let Some(out) = pick_save(hwnd) else { return };
+    if std::path::Path::new(&out) == std::path::Path::new(&app.path) {
+        message_box(
+            hwnd,
+            "Write the repair somewhere else. Repairing a file over itself is how a bad \
+             day becomes an unrecoverable one.",
+            "pstfree",
+            MB_ICONWARNING,
+        );
+        return;
     }
 
-    let st = export::export(pst, &app.nodes, &names, root, format);
-    let msg = format!(
-        "{} message(s) written to {dir}{}{}",
-        st.messages,
-        if st.attachments > 0 {
-            format!("\n{} attachment(s) included.", st.attachments)
-        } else {
-            String::new()
-        },
-        if st.failed > 0 {
-            format!("\n{} could not be written.", st.failed)
-        } else {
-            String::new()
+    spawn_job(hwnd, app, "Repairing", move |pst, nodes, on| {
+        let blocks = index_blocks(pst);
+        match pstfree::repair::rebuild(pst, &nodes, &blocks, &out, on) {
+            Err(e) => format!("Nothing was written.\n\n{e}"),
+            Ok(r) => {
+                let mut msg = format!(
+                    "Wrote {out}\n\n{} node(s), {} block(s), {} bytes.",
+                    r.nodes, r.blocks, r.bytes
+                );
+                if r.dropped_blocks > 0 || r.dropped_nodes > 0 {
+                    msg += &format!(
+                        "\n\nLeft out {} block(s) that failed their own checksum, and {} \
+                         node(s) whose data they held.",
+                        r.dropped_blocks, r.dropped_nodes
+                    );
+                }
+                if r.missing.is_empty() {
+                    msg += "\n\nThe allocation maps go out marked invalid, which is the \
+                            documented way to say 'rebuild these before writing'. Outlook \
+                            does that on open, and reopening the file here will report \
+                            that one thing on purpose.";
+                } else {
+                    msg += &format!(
+                        "\n\nThis file will NOT open: it has no {}. That node's data block \
+                         did not survive, and no index can point at bytes that are gone. \
+                         pstfree still reads the result, so export is the way to get this \
+                         mail out.",
+                        r.missing.join(", no ")
+                    );
+                }
+                msg
+            }
         }
+    });
+}
+
+/// Everything that was wrong with the file, in full, rather than as a count.
+unsafe fn do_report(hwnd: HWND, app: &mut App) {
+    if app.pst.is_none() {
+        message_box(hwnd, "Open a file first.", "pstfree", MB_ICONINFORMATION);
+        return;
+    }
+    let mut msg = String::new();
+    if app.salvaged {
+        msg += "The index in the header could not be read. The one in use was rebuilt by \
+                sweeping the file for surviving B-tree pages and carving blocks out of the \
+                file itself.\n\n";
+    }
+    if app.problems.is_empty() {
+        msg += "Nothing else is wrong with this file. Every checksum in it verifies.";
+    } else {
+        msg += &format!("{} problem(s):\n", app.problems.len());
+        for w in &app.problems {
+            msg += &format!("\n  \u{2022} {w}");
+        }
+    }
+    message_box(
+        hwnd,
+        &msg,
+        "What is wrong with this file",
+        MB_ICONINFORMATION,
     );
-    set_status(hwnd, &msg.replace('\n', " "));
-    message_box(hwnd, &msg, "Export finished", MB_ICONINFORMATION);
+}
+
+/// A file is open and nothing else is running. Both refusals say which it is.
+unsafe fn ready(hwnd: HWND, app: &App) -> bool {
+    if app.pst.is_none() {
+        message_box(hwnd, "Open a file first.", "pstfree", MB_ICONINFORMATION);
+        return false;
+    }
+    if app.busy {
+        message_box(
+            hwnd,
+            "Something is already running. Wait for it to finish.",
+            "pstfree",
+            MB_ICONINFORMATION,
+        );
+        return false;
+    }
+    true
+}
+
+/// Run a long job on its own thread, against its own handle on the same file.
+///
+/// A rebuild or an export of a mailbox-sized PST takes minutes, and doing it on the
+/// message loop is how a window ends up saying "Not Responding". The worker opens the
+/// file a second time rather than borrowing the one on screen: it is opened read-only,
+/// so a second handle costs nothing and removes every question about sharing the first.
+unsafe fn spawn_job<F>(hwnd: HWND, app: &mut App, label: &'static str, job: F)
+where
+    F: FnOnce(&mut Pst, Vec<Node>, pstfree::Progress) -> String + Send + 'static,
+{
+    let post = Poster(hwnd);
+    let path = app.path.clone();
+    app.busy = true;
+    set_status(hwnd, &format!("{label}..."));
+
+    // Closing the window mid-job leaks the last message's String, because there is no
+    // longer a handler to take it back. The process is on its way out at that point, so
+    // that is the whole of the cost.
+    std::thread::spawn(move || {
+        let done = match load(&path) {
+            Err(e) => format!("{path} could not be reopened for this: {e}"),
+            Ok((mut pst, nodes, _)) => {
+                // Throttled here rather than in the library: every tick is a window
+                // message, and a million of them would be the slow part of the job.
+                let mut last = std::time::Instant::now();
+                let mut on = |a: u64, b: u64| {
+                    let now = std::time::Instant::now();
+                    if now - last >= std::time::Duration::from_millis(150) {
+                        last = now;
+                        let pct = (a * 100).checked_div(b).unwrap_or(100);
+                        post.say(WM_JOB_PROGRESS, format!("{label}: {a} of {b} ({pct}%)"));
+                    }
+                };
+                job(&mut pst, nodes, &mut on)
+            }
+        };
+        post.say(WM_JOB_DONE, done);
+    });
 }

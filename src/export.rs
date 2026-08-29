@@ -62,6 +62,7 @@ pub fn export(
     folder_names: &BTreeMap<u32, String>,
     root: &Path,
     format: Format,
+    on: crate::Progress,
 ) -> Stats {
     let mut st = Stats {
         messages: 0,
@@ -70,8 +71,12 @@ pub fn export(
         errors: Vec::new(),
     };
     let paths = folder_paths(nodes, folder_names, root);
+    let total = nodes.iter().filter(|n| n.nid_type() == 0x04).count() as u64;
+    let mut done = 0u64;
 
     for n in nodes.iter().filter(|n| n.nid_type() == 0x04) {
+        done += 1;
+        on(done, total);
         // A message whose folder is missing still gets written out. In a damaged file it
         // is the one most worth keeping, so it must not be the one that is dropped.
         let dir = paths

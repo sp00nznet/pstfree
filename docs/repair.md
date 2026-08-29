@@ -148,7 +148,22 @@ The sweeps had to keep up too. Carving tests every 64-byte boundary in the file,
 read call each is 600 million of them on a 40GB file; both sweeps now read a megabyte at a
 time and work out of the buffer. On a 400MB file that took a sweep from 14 seconds to 0.4.
 
-Checked rather than asserted: a 40MB file of blocks that no index mentions, carved and
-rebuilt into a **41MB PST across 171 AMap sections** — every map slot in all 171 still
-empty, every block re-read and matched against its own checksum, and the result opened by
-libpff, which reads the mail back out of it.
+Checked rather than asserted: a 700MB file of blocks that no index mentions, carved and
+rebuilt in 3.5 seconds into a **726MB PST across 2,996 AMap sections** — every map slot in
+all 2,996 still empty, all 89,750 blocks re-read and matched against their own checksums,
+and the result opened by libpff, which reads the mail back out of it. That is 23 times past
+the size this used to refuse at.
+
+## From the window
+
+Repair is in `pstfree-gui.exe` as **File → Repair to a new .pst**, which is where most
+people who download this will look for it — the window is the more downloaded of the two
+binaries, and until now it was the one that could not do the thing the project is for.
+
+It runs on its own thread against its own handle on the file, so the window keeps painting
+and the status bar counts blocks while it works; a repair that takes minutes does not look
+like a crash. The output is byte-for-byte the same file the command line writes from the
+same input, because it is the same code with a different front end.
+
+**File → What is wrong with this file** prints the damage report in full — whether the
+index had to be swept, and every problem found, named rather than counted.

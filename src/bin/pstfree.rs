@@ -24,6 +24,7 @@ pstfree - read, export and repair Outlook PST/OST files
   pstfree <file.pst> --verify   check every checksum, and what a sweep would recover
   pstfree <file.pst> --nodes    every node in the file
   pstfree <file.pst> --blocks   every block in the file
+  pstfree --version             which build this is
 
 Add --salvage to any command to rebuild the index by sweeping the file for
 surviving B-tree pages, instead of following the one in the header.
@@ -32,8 +33,45 @@ No Outlook needed, and no password is ever asked for - a PST password is a
 checksum, not a key, and it protects nothing.
 ";
 
+/// The version, so a downloaded .exe with no installer behind it can still say what it
+/// is. Both binaries report it; this one on the command line, the window in its title.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Print a job's progress over one line of stderr, but only once it is clear the job is
+/// slow enough to need it.
+///
+/// Two seconds of silence first, because most files finish long before that and a bar
+/// that flashes past is worse than no bar. stderr rather than stdout so that redirecting
+/// the output of `--export` or `--rebuild` still gets only the result.
+fn bar(label: &'static str) -> impl FnMut(u64, u64) {
+    use std::io::Write;
+    let start = std::time::Instant::now();
+    let mut last = start;
+
+    move |done, total| {
+        let now = std::time::Instant::now();
+        if now - start < std::time::Duration::from_secs(2)
+            || (done < total && now - last < std::time::Duration::from_millis(200))
+        {
+            return;
+        }
+        last = now;
+
+        let pct = (done * 100).checked_div(total).unwrap_or(100);
+        eprint!("\r  {label}: {done} of {total} ({pct}%)   ");
+        if done >= total {
+            eprintln!();
+        }
+        let _ = std::io::stderr().flush();
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("pstfree {VERSION}");
+        return;
+    }
     let path = match args.first() {
         Some(a) if !a.starts_with('-') => a.clone(),
         _ => {
@@ -60,7 +98,7 @@ fn main() {
                 eprintln!("--rebuild needs somewhere to write, e.g. --rebuild fixed.pst");
                 std::process::exit(2);
             };
-            match pstfree::repair::rebuild(&mut pst, &nodes, &blocks, out) {
+            match pstfree::repair::rebuild(&mut pst, &nodes, &blocks, out, &mut bar("copied")) {
                 Ok(r) => {
                     println!(
                         "Wrote {out}: {} node(s), {} block(s), {} bytes.",
@@ -491,7 +529,7 @@ fn run_export(pst: &mut Pst, nodes: &[Node], dir: Option<&str>, format: export::
     }
 
     let (names, _, _) = folders(pst, nodes);
-    let st = export::export(pst, nodes, &names, root, format);
+    let st = export::export(pst, nodes, &names, root, format, &mut bar("written"));
 
     println!("{} message(s) written to {dir}", st.messages);
     if st.attachments > 0 {

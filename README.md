@@ -112,6 +112,7 @@ libpff refuses to open `torn.pst` and reads all four messages out of `fixed.pst`
 | `--rebuild <out.pst>` | write a clean copy with a fresh index |
 | `--verify` | check every checksum, and what a sweep would recover |
 | `--salvage` | on any command: ignore the header's index and rebuild it |
+| `--version` | which build this is |
 
 ## What it does
 
@@ -129,6 +130,11 @@ the rest are written. See [docs/exporting.md](docs/exporting.md).
 wrong; rebuild the node and block B-trees from surviving pages; carve blocks straight out
 of the file with no index at all; and write the result back out as a clean `.pst`, at any
 size. See [docs/repair.md](docs/repair.md).
+
+**The window** does all of it too. Folders, messages and bodies; export in any of the three
+formats; repair to a new `.pst`; and a plain-language report of everything wrong with the
+file rather than a count of it. The long jobs run on their own thread with a live count, so
+a mailbox-sized repair neither freezes the window nor looks like a hang on the command line.
 
 **Not in scope** — writing to a live Outlook profile, MAPI, Exchange, and new Outlook's own
 undocumented local store. Reading a file is a different job from being a mail client.

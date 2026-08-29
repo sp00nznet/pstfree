@@ -225,6 +225,7 @@ pub fn rebuild(
     nodes: &[Node],
     blocks: &[Block],
     out: &str,
+    on: crate::Progress,
 ) -> Result<Rebuilt, String> {
     if !pst.is_small_page() {
         return Err(
@@ -238,9 +239,16 @@ pub fn rebuild(
     // Blocks first: a node is only worth keeping if the block holding its data survived.
     // Only which blocks survived is remembered here, not their bytes — the file being
     // rebuilt can be tens of gigabytes, and it is read a second time to write them out.
+    // Both passes over the blocks count towards one bar. They are the same work twice —
+    // a read of every surviving block — so a half-full bar means roughly half the time.
+    let steps = 2 * blocks.len() as u64;
+    let mut step = 0;
+
     let mut kept: Vec<Block> = Vec::new();
     let mut dropped_blocks = 0;
     for b in blocks {
+        step += 1;
+        on(step, steps);
         if pst.block_intact(b) {
             kept.push(*b);
         } else {
@@ -347,7 +355,9 @@ pub fn rebuild(
     // through: header, blocks, then the two trees, with the gaps zero-filled as they come.
     // Streaming rather than assembling it in memory is what lets the size cap go — a 40GB
     // mailbox is a normal thing to be handed and is not going to fit in a Vec.
-    if let Err(e) = write_out(pst, &header, &placed, &nbt_pages, &bbt_pages, eof, out) {
+    if let Err(e) = write_out(
+        pst, &header, &placed, &nbt_pages, &bbt_pages, eof, out, on, step, steps,
+    ) {
         // A half-written repair looks like a repair. It is a fresh file, so the damaged
         // original is untouched either way, but nobody should be left holding this one.
         let _ = std::fs::remove_file(out);
@@ -369,6 +379,7 @@ pub fn rebuild(
 /// `placed` and the tree pages are already in rising offset order, so this never seeks:
 /// it pads to the next offset with zeroes and writes. The gaps are an alignment remainder
 /// or a map slot group, never more than a couple of kilobytes.
+#[allow(clippy::too_many_arguments)] // one write pass, and everything it writes
 fn write_out(
     pst: &mut Pst,
     header: &[u8],
@@ -377,6 +388,9 @@ fn write_out(
     bbt_pages: &[(u64, Vec<u8>)],
     eof: u64,
     out: &str,
+    on: crate::Progress,
+    mut step: u64,
+    steps: u64,
 ) -> Result<(), String> {
     let f = std::fs::File::create(out).map_err(|e| format!("{out}: {e}"))?;
     let mut f = std::io::BufWriter::with_capacity(1 << 20, f);
@@ -387,6 +401,8 @@ fn write_out(
     pos += header.len() as u64;
 
     for (b, at) in placed {
+        step += 1;
+        on(step, steps);
         pad(&mut f, &mut pos, *at).map_err(io)?;
         let mut bytes = pst.raw_block(b)?;
         // The one field a move invalidates. Length, CRC and id all describe bytes that
@@ -442,7 +458,8 @@ mod tests {
 
         let out = std::env::temp_dir().join("pstfree-rebuild-test.pst");
         let out = out.to_str().unwrap();
-        let r = rebuild(&mut pst, &nodes, &blocks, out).expect("rebuild should succeed");
+        let r = rebuild(&mut pst, &nodes, &blocks, out, &mut |_, _| {})
+            .expect("rebuild should succeed");
         assert!(r.missing.is_empty(), "rebuilt without {:?}", r.missing);
 
         let mut back = Pst::open(out).expect("a rebuilt file should open");
@@ -540,7 +557,17 @@ mod tests {
 
         let out = std::env::temp_dir().join("pstfree-rebuild-big-out.pst");
         let out = out.to_str().unwrap();
-        let r = rebuild(&mut pst, &nodes, &blocks, out).expect("rebuild should succeed");
+        // The bar has to be monotonic and land exactly on its own total, or the two
+        // front ends are drawing a percentage that goes backwards or stops short.
+        let mut seen = 0u64;
+        let mut total = 0u64;
+        let r = rebuild(&mut pst, &nodes, &blocks, out, &mut |done, of| {
+            assert!(done > seen, "progress went from {seen} to {done}");
+            seen = done;
+            total = of;
+        })
+        .expect("rebuild should succeed");
+        assert_eq!(seen, total, "the bar stopped short of its own total");
         assert!(r.missing.is_empty(), "rebuilt without {:?}", r.missing);
         assert!(
             r.bytes > AMAP_FIRST + AMAP_EVERY,
