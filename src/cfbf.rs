@@ -341,8 +341,8 @@ mod tests {
                 }
                 u32::from_le_bytes(sector(d)[k * 4..k * 4 + 4].try_into().unwrap())
             };
-            for c in sector(id).chunks_exact(4) {
-                fat.push(u32::from_le_bytes(c.try_into().unwrap()));
+            for c in sector(id).as_chunks::<4>().0 {
+                fat.push(u32::from_le_bytes(*c));
             }
         }
 
@@ -362,23 +362,27 @@ mod tests {
         let dir = follow(u32at(48), &fat);
         let minifat_raw = follow(u32at(60), &fat);
         let minifat: Vec<u32> = minifat_raw
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
             .collect();
 
         // The root entry's own stream is the mini stream.
         let mini = follow(u32::from_le_bytes(dir[116..120].try_into().unwrap()), &fat);
 
         let mut out = BTreeMap::new();
-        for e in dir.chunks_exact(128) {
+        for e in dir.as_chunks::<128>().0 {
             if e[66] != 2 {
                 continue; // not a stream
             }
             let nlen = u16::from_le_bytes(e[64..66].try_into().unwrap()) as usize;
             let name: String = String::from_utf16_lossy(
                 &e[..nlen.saturating_sub(2)]
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| u16::from_le_bytes(*c))
                     .collect::<Vec<u16>>(),
             );
             let start = u32::from_le_bytes(e[116..120].try_into().unwrap());
