@@ -314,7 +314,7 @@ pub fn read_names(pst: &mut Pst, nodes: &[Node]) -> Names {
     let mut out = BTreeMap::new();
     // NAMEID: dwPropertyID, then the N bit and a 15-bit GUID index, then the index that
     // says which 0x8000-and-up id this record is describing.
-    for e in entries.chunks_exact(8) {
+    for e in entries.as_chunks::<8>().0 {
         let dw = u32::from_le_bytes(e[0..4].try_into().unwrap());
         let w = u16::from_le_bytes(e[4..6].try_into().unwrap());
         let id = 0x8000u32 + u16::from_le_bytes(e[6..8].try_into().unwrap()) as u32;
@@ -345,8 +345,10 @@ pub fn read_names(pst: &mut Pst, nodes: &[Node]) -> Names {
             match strings.get(at + 4..at + 4 + len) {
                 Some(s) => {
                     let u: Vec<u16> = s
-                        .chunks_exact(2)
-                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|c| u16::from_le_bytes(*c))
                         .collect();
                     format!("\"{}\"", String::from_utf16_lossy(&u))
                 }
@@ -815,8 +817,10 @@ fn decode_inline(ptype: u16, b: &[u8]) -> Value {
 /// an unpaired surrogate, so this drops those rather than refusing the whole name.
 fn utf16le(b: &[u8]) -> String {
     let units: Vec<u16> = b
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     String::from_utf16_lossy(&units)
 }
