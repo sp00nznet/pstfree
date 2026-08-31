@@ -8,9 +8,13 @@ service, nothing left behind — and neither one ever asks for a password, becau
 password is not a lock.
 
 **Delete both of a PST's B-tree roots and it still recovers every message, byte for byte —
-then writes the whole thing back out as a clean file Outlook can open.** At any size: the
-32MB ceiling on rebuilding is gone as of v0.2.0, and a sweep of a 400MB file went from 14
-seconds to 0.4.
+then writes the whole thing back out as a clean file Outlook can open.** At any size, since
+v0.2.0: a 726MB rebuild takes about three seconds, and a sweep of a 400MB file went from 14
+seconds to 0.4. Point it at an `.ost` and it writes a `.pst` instead — v0.3.0 — which is
+the other thing there is an industry selling.
+
+**[Download the two executables](https://github.com/sp00nznet/pstfree/releases/latest)** —
+no installer, no runtime, nothing to build. Or build it yourself, it takes one command.
 
 ![pstfree](docs/screenshot.png)
 
@@ -70,10 +74,15 @@ longer version is in [docs/prior-art.md](docs/prior-art.md).
 
 ## Try it
 
+Take `pstfree-gui.exe` and `pstfree.exe` from the
+[latest release](https://github.com/sp00nznet/pstfree/releases/latest) and run them, or
+build them with `cargo build --release` — there is one dependency and no build script.
+
 ```
-cargo build --release
-target\release\pstfree-gui.exe archive.pst     the window
-target\release\pstfree.exe archive.pst --tree  the command line
+pstfree-gui.exe archive.pst          the window
+pstfree.exe archive.pst --tree       the command line
+pstfree.exe archive.pst --verify     what is wrong with it
+pstfree.exe mailbox.ost --rebuild archive.pst    an OST, written out as a PST
 ```
 
 **This is a password-protected PST.** No password was set, supplied or requested:
