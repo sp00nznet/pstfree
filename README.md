@@ -18,8 +18,10 @@ no installer, no runtime, nothing to build. Or build it yourself, it takes one c
 
 ![pstfree](docs/screenshot.png)
 
-Sibling project to [vncfree](https://github.com/sp00nznet/vncfree), same attitude: find
-the Windows payware, read the published spec it is hiding behind, give it away.
+Sister project to [bulkhead](https://github.com/sp00nznet/bulkhead),
+[futureburn](https://github.com/sp00nznet/futureburn) and
+[vncfree](https://github.com/sp00nznet/vncfree) — same attitude: find the Windows payware,
+read the published spec it is hiding behind, give it away. [Why](PHILOSOPHY.md).
 
 ## Why
 
@@ -233,6 +235,18 @@ cargo test
 - **[freepst]** (Bob Rudis), for the public PST/OST test fixtures.
 - **[XstReader]**, **[java-libpst]** and **[libpst]**, for getting there first.
 - [miniz_oxide] and [windows-sys], the only two dependencies, both MIT.
+
+## The sister projects
+
+| | |
+|---|---|
+| [bulkhead](https://github.com/sp00nznet/bulkhead) | Block-level backup, recovery and certified secure erase for Windows. |
+| [futureburn](https://github.com/sp00nznet/futureburn) | CD, DVD and Blu-ray burning, ripping and image mounting. |
+| [vncfree](https://github.com/sp00nznet/vncfree) | A VNC client and server with no subscription and no ad-gated download. |
+
+Same method every time: read the published spec, call the OS API that is
+already there, ship one executable, MIT. Why that is worth doing at all is
+written down in **[PHILOSOPHY.md](PHILOSOPHY.md)**.
 
 ## Licence
 
