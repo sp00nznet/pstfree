@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="net.sp00nz.pstfree" version="1.0.0.0" processorArchitecture="*"/>
+  <description>Read, export and repair Outlook PST and OST files.</description>
+
+  <!-- Version 6 of the common controls. Without this the window gets the version 5
+       library that shipped with Windows 95, which is why an unmanifested Win32 program
+       looks thirty years old however carefully it is laid out. Nothing in the code
+       changes; the same tree, list and toolbar are simply drawn by the themed library. -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls"
+                        version="6.0.0.0" processorArchitecture="*"
+                        publicKeyToken="6595b64144ccf1df" language="*"/>
+    </dependentAssembly>
+  </dependency>
+
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <!-- System DPI aware: the window is drawn at the display's real pixel density
+           rather than being bitmap-scaled up, which is the difference between sharp text
+           and blurry text on every laptop sold in the last ten years.
+
+           Deliberately not PerMonitorV2. Claiming that means promising to redraw at a
+           new scale when the window is dragged to a second monitor, which needs a
+           re-made font, a re-made toolbar image list and a WM_DPICHANGED handler — and a
+           program that declares per-monitor awareness and then does not do those things
+           is worse off than one that never claimed it, because Windows stops
+           compensating. As it stands a move to a differently-scaled monitor is slightly
+           soft and correct, which is the right trade for a window somebody opens to read
+           a file and then closes. -->
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
+      <!-- A PST sitting under a deeply nested export directory is the ordinary case here,
+           and an export writes one file per message into a tree of folder names taken
+           from the file itself. 260 characters is not a lot of that. -->
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/> <!-- 10 and 11 -->
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/> <!-- 8.1 -->
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/> <!-- 8 -->
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/> <!-- 7 -->
+    </application>
+  </compatibility>
+</assembly>

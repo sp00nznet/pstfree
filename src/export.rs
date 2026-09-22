@@ -98,6 +98,34 @@ pub fn export(
     st
 }
 
+/// The slice of a file's nodes that covers one folder and everything under it.
+///
+/// This is all "export just this folder" needs to be: [`export`] writes the messages it
+/// is given and builds its directory tree from the folder nodes, so handing it fewer
+/// messages is the whole of the feature. Every folder node is kept regardless — dropping
+/// them would put the surviving messages in `_no-folder` instead of where they live.
+pub fn subtree(nodes: &[Node], root: u32) -> Vec<Node> {
+    let mut want = std::collections::HashSet::from([root]);
+    // Children can appear before their parent in the B-tree, so this goes round until it
+    // stops finding anything rather than assuming an order the file never promised.
+    loop {
+        let before = want.len();
+        for n in nodes.iter().filter(|n| n.nid_type() == 0x02) {
+            if n.nid != n.nid_parent && want.contains(&n.nid_parent) {
+                want.insert(n.nid);
+            }
+        }
+        if want.len() == before {
+            break;
+        }
+    }
+    nodes
+        .iter()
+        .filter(|n| n.nid_type() == 0x02 || want.contains(&n.nid_parent))
+        .copied()
+        .collect()
+}
+
 /// A directory path for each folder, mirroring the tree.
 fn folder_paths(
     nodes: &[Node],

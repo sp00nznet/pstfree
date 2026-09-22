@@ -1,4 +1,4 @@
-//! Turn an Outlook 2013+ OST into a PST.
+//! Turn a file a PST cannot hold into one: an Outlook 2013+ OST, or an ANSI PST.
 //!
 //! This is the third thing the payware sells — "OST to PST Converter" — and the one
 //! [`repair`](crate::repair) refused, correctly, because it is not a repair. A repair
@@ -7,6 +7,15 @@
 //! 2013 OST uses stores its blocks compressed, up to 64KB each, and a PST's blocks are
 //! plain and hold 8176 bytes at the very most. Every block has to be decoded, and some of
 //! them have to be taken apart.
+//!
+//! An ANSI PST — Outlook 97 to 2002 — arrives here for a different reason and leaves by
+//! the same door. Nothing in it is compressed and its blocks are already small enough,
+//! but every id and offset in it is 32 bits and both its trailers are a different shape,
+//! so a block copied across would carry a trailer no Unicode reader can parse. Rebuilding
+//! a level up sidesteps all of that: the *contents* of a stream are the same bytes in
+//! both formats, and it is only the plumbing around them that has to be rewritten. The
+//! same pass also lifts the 2GB ceiling the ANSI format is stuck behind, which is the
+//! other half of why anyone wants this conversion.
 //!
 //! So this rebuilds the file a level up. It walks the nodes, and for each one takes the
 //! *data stream* behind it — whatever chain of blocks and XBLOCKs the OST used to hold it
@@ -297,7 +306,7 @@ impl Out {
     }
 }
 
-/// Write an OST out as a PST, node by node.
+/// Write an OST or an ANSI PST out as a Unicode PST, node by node.
 pub fn convert(
     pst: &mut Pst,
     nodes: &[Node],
@@ -314,6 +323,7 @@ pub fn convert(
         .unwrap_or(0)
         >> 2)
         + 1;
+    let ansi = pst.is_ansi();
     let mut o = Out::new(out, first)?;
 
     let mut nbt: Vec<(u64, Vec<u8>)> = Vec::new();
@@ -423,6 +433,11 @@ pub fn convert(
         missing,
         bytes: eof,
         converted: true,
+        source: if ansi {
+            "an ANSI PST (Outlook 97-2002)"
+        } else {
+            "an Outlook 2013 OST"
+        },
         problems: o.problems,
     })
 }

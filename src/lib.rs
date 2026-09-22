@@ -2,7 +2,8 @@
 //!
 //! Layered the way the format is: [`ndb`] is blocks and B-trees, [`ltp`] is heaps,
 //! properties and tables on top of them, [`export`] turns what comes out into mail, and
-//! [`crypt`] and [`cfbf`] are the two self-contained formats needed along the way.
+//! [`crypt`] and [`cfbf`] are the two self-contained formats needed along the way,
+//! and [`html`] is what makes a rich-text body readable without a browser in the process.
 
 /// What a long job calls as it goes: how much of it is done, out of how much.
 ///
@@ -16,6 +17,7 @@ pub mod cfbf;
 pub mod convert;
 pub mod crypt;
 pub mod export;
+pub mod html;
 pub mod ltp;
 pub mod ndb;
 pub mod repair;

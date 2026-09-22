@@ -13,13 +13,19 @@ v0.2.0: a 726MB rebuild takes about three seconds, and a sweep of a 400MB file w
 seconds to 0.4. Point it at an `.ost` and it writes a `.pst` instead — v0.3.0 — which is
 the other thing there is an industry selling.
 
+New in v0.4.0: **search the whole mailbox**, subject, sender and message body; **export one
+folder or one message** instead of all of it; rich-text messages **readable in the window**
+rather than only after export; and **Outlook 97–2002 ANSI files**, which used to be refused
+outright and now open, export and convert to the modern format.
+
 **[Download the two executables](https://github.com/sp00nznet/pstfree/releases/latest)** —
 no installer, no runtime, nothing to build. Or build it yourself, it takes one command.
 
 ![pstfree](docs/screenshot.png)
 
 Sister project to [bulkhead](https://github.com/sp00nznet/bulkhead),
-[futureburn](https://github.com/sp00nznet/futureburn) and
+[futureburn](https://github.com/sp00nznet/futureburn),
+[opennote](https://github.com/sp00nznet/opennote) and
 [vncfree](https://github.com/sp00nznet/vncfree) — same attitude: find the Windows payware,
 read the published spec it is hiding behind, give it away. [Why](PHILOSOPHY.md).
 
@@ -84,7 +90,9 @@ build them with `cargo build --release` — there is one dependency and no build
 pstfree-gui.exe archive.pst          the window
 pstfree.exe archive.pst --tree       the command line
 pstfree.exe archive.pst --verify     what is wrong with it
+pstfree.exe archive.pst --find invoice           every message that mentions it
 pstfree.exe mailbox.ost --rebuild archive.pst    an OST, written out as a PST
+pstfree.exe old.pst --rebuild new.pst            an ANSI PST, written out as Unicode
 ```
 
 **This is a password-protected PST.** No password was set, supplied or requested:
@@ -123,7 +131,8 @@ libpff refuses to open `torn.pst` and reads all four messages out of `fixed.pst`
 | `--tree` | the folder tree, with message counts |
 | `--list` | every message: date, folder, sender, subject |
 | `--props <nid>` | every property on one node, named where the file names them |
-| `--export <dir> [--format eml\|mbox\|msg]` | write the mail out |
+| `--find <text>` | every message whose subject, sender or body mentions it |
+| `--export <dir> [--format eml\|mbox\|msg] [--folder <name>]` | write the mail out, all of it or one folder |
 | `--rebuild <out.pst>` | write a clean copy with a fresh index — from an `.ost`, a converted `.pst` |
 | `--verify` | check every checksum, and what a sweep would recover |
 | `--salvage` | on any command: ignore the header's index and rebuild it |
@@ -131,13 +140,22 @@ libpff refuses to open `torn.pst` and reads all four messages out of `fixed.pst`
 
 ## What it does
 
-**Reading** — Unicode PST and OST. Folder tree, messages, properties, attachments,
-embedded messages, plain/HTML/compressed-RTF bodies, calendar and contacts. Named
-properties resolved through the file's own map. Password ignored, because there is nothing
-there to ignore.
+**Reading** — Unicode PST and OST, and ANSI PST. Folder tree, messages, properties,
+attachments, embedded messages, plain/HTML/compressed-RTF bodies, calendar and contacts.
+Named properties resolved through the file's own map. A message with only an HTML body has
+its markup taken off and is read in the window like any other — not rendered, which would
+mean hosting a browser in a program whose whole promise is that there is nothing to
+install. Password ignored, because there is nothing there to ignore.
+
+**Search** — `--find`, and the box in the window: subject, sender and body, one
+case-insensitive substring, across every folder at once. It works the same on a file whose
+index had to be rebuilt by sweeping as on an intact one, which is the only version of this
+feature worth having in a recovery tool. The result says which field matched, because most
+hits are in the body and a row with nothing visibly matching on it otherwise looks broken.
 
 **Export** — `.eml` per message with attachments inline, `.mbox` per folder, or `.msg` with
-the MAPI properties kept. Nothing is invented: no timezone the file does not record, no
+the MAPI properties kept — all of it, one folder and everything under it, or the one
+message you are looking at. Nothing is invented: no timezone the file does not record, no
 character set re-guessed. Nothing stops: one unreadable message is counted and named, and
 the rest are written. See [docs/exporting.md](docs/exporting.md).
 
@@ -150,13 +168,24 @@ size. See [docs/repair.md](docs/repair.md).
 later use for an OST stores blocks compressed and up to 64KB each, where a PST's are plain
 and hold 8176 bytes, so nothing can be copied: every data stream is decoded and laid out
 again. libpff reads the source OST and the converted PST and gets **46 folders, 3 messages
-and 202 properties out of each, identical id for id and byte for byte**. See
+and 202 properties out of each, identical id for id and byte for byte**. The same pass
+converts an **ANSI PST** — Outlook 97 to 2002 — to the modern Unicode format, and lifts the
+2GB ceiling that generation of files is stuck behind. See
 [docs/converting.md](docs/converting.md).
 
-**The window** does all of it too. Folders, messages and bodies; export in any of the three
-formats; repair to a new `.pst`; and a plain-language report of everything wrong with the
-file rather than a count of it. The long jobs run on their own thread with a live count, so
-a mailbox-sized repair neither freezes the window nor looks like a hang on the command line.
+**The window** does all of it too. Folders, messages and bodies; a search box; export in any
+of the three formats, or of one folder or one message; repair to a new `.pst`; and a
+plain-language report of everything wrong with the file rather than a count of it. The long
+jobs run on their own thread with a live count, so a mailbox-sized repair neither freezes
+the window nor looks like a hang on the command line.
+
+It also, as of v0.4.0, looks like a program from this decade: the common controls Windows
+has shipped since 2001 rather than the ones from 1995, the font the rest of the system is
+using rather than the stock bitmap one, an icon, a toolbar, and a window that is sharp on a
+scaled display. None of that needed a build script or a dependency — the manifest is
+embedded by the linker and the icons are drawn from geometry by
+[asset-forge](https://github.com/sp00nznet/asset-forge)'s `ui_icons.py`, the same generator
+opennote's toolbar uses.
 
 **Not in scope** — writing to a live Outlook profile, MAPI, Exchange, and new Outlook's own
 undocumented local store. Reading a file is a different job from being a mail client.
@@ -165,8 +194,13 @@ undocumented local store. Reading a file is a different job from being a mail cl
 
 Stated plainly, because a repair tool that overstates itself is the thing this replaces.
 
-- **ANSI PST (Outlook 97–2002) is refused, not half-parsed.** Different header layout, 2GB
-  ceiling. No sample has turned up to build it against.
+- **ANSI PST (Outlook 97–2002) has never been tested against a real file.** It reads,
+  exports and converts, and every ANSI-specific difference — the 512-byte header, the
+  32-bit ids, the 12-byte trailers with the id and the checksum the other way round, the
+  subnode block with no padding — is covered by tests. But **no public ANSI PST exists**;
+  the fixture those tests use is one this repo writes itself from MS-PST 2.2.2.6 and
+  2.2.2.7. That is real evidence and it is not the same evidence as a file Outlook 97
+  wrote. If you have one, it is the single most useful thing anybody could send.
 - **`--rebuild` always writes a 512-byte-page Unicode PST.** Hand it an Outlook 2013 OST
   and it converts: every block decoded, inflated and laid out again as a PST stores them.
   That is a new file rather than a copy, so it says so, and the check that backs it is
@@ -185,6 +219,9 @@ Stated plainly, because a repair tool that overstates itself is the thing this r
   data. Settling it properly needs a PST over 125MB written by Outlook.
 - **Attachment extraction has never seen a real attachment**, because none of the three
   public fixtures has one.
+- **An HTML body is reduced to text, not rendered.** Tables become their cells in order,
+  images leave only their `alt` text, and a link keeps its text and loses its URL. Export
+  to `.eml` and open that in a mail client to see the message as it was sent.
 - **Cyclic encoding has never decoded a real file** — no fixture uses it.
 - **Recovery has only been tested against damage this repo inflicted itself.** There is no
   public corpus of broken PSTs; every route was checked and none exists.
@@ -194,8 +231,9 @@ The full list, including the places the first reading of the spec was wrong, is 
 
 ## How it is tested
 
-49 tests, against a real PST, a real 2013 OST and a real password-protected PST — the
-public fixtures from [freepst], fetched by `tests\fetch-fixtures.ps1`. Test files are never
+65 tests, against a real PST, a real 2013 OST and a real password-protected PST — the
+public fixtures from [freepst], fetched by `tests\fetch-fixtures.ps1` — plus an ANSI PST
+this repo builds itself, because there is no public one to fetch. Test files are never
 committed, because real PSTs contain real mail; the tests skip rather than fail when they
 are absent.
 
@@ -242,6 +280,7 @@ cargo test
 |---|---|
 | [bulkhead](https://github.com/sp00nznet/bulkhead) | Block-level backup, recovery and certified secure erase for Windows. |
 | [futureburn](https://github.com/sp00nznet/futureburn) | CD, DVD and Blu-ray burning, ripping and image mounting. |
+| [opennote](https://github.com/sp00nznet/opennote) | The WordPad Windows removed, plus `.docx` and fillable PDFs. Its icon generator draws this window's toolbar too, which is why the two look related. |
 | [vncfree](https://github.com/sp00nznet/vncfree) | A VNC client and server with no subscription and no ad-gated download. |
 
 Same method every time: read the published spec, call the OS API that is

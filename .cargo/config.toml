@@ -1,0 +1,23 @@
+# The application manifest, embedded by the linker.
+#
+# A Win32 program needs a manifest to get version 6 of the common controls — without one
+# Windows hands it the version 5 library from 1995 and the window looks it — and to
+# declare that it understands a scaled display. The usual way to attach one is a build
+# script plus a crate to drive it, and this project has neither on purpose: one dependency
+# and `cargo build --release`, nothing else. `link.exe` will embed a manifest directly, so
+# that is what happens here, in eight lines of configuration instead.
+#
+# It applies to both executables. The console one gains a manifest it does not strictly
+# need, which costs a few hundred bytes and makes it long-path and UTF-8 aware, neither of
+# which does any harm to a tool that writes exported mail into deep directory trees.
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "link-arg=/MANIFEST:EMBED",
+    "-C", "link-arg=/MANIFESTINPUT:res/pstfree.manifest",
+]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = [
+    "-C", "link-arg=/MANIFEST:EMBED",
+    "-C", "link-arg=/MANIFESTINPUT:res/pstfree.manifest",
+]

@@ -22,8 +22,25 @@ Updated as things land. Nothing is claimed until it runs.
 | 10 | Rebuild a mailbox-sized PST: no size ceiling, and a sweep that finishes | ✅ done — verified at 726MB |
 | 11 | Repair from the window, a readable damage report, and progress on the long jobs | ✅ done |
 | 12 | OST → PST: decode, inflate and lay every data stream out again | ✅ done — libpff agrees on both sides |
+| 13 | Rich-text messages readable in the window, without a browser in the process | ✅ done |
+| 14 | Search the whole mailbox — subject, sender and body | ✅ done — `--find`, and the box in the window |
+| 15 | Export one folder or one message instead of all of it | ✅ done |
+| 16 | ANSI PST (Outlook 97–2002): read it, and convert it to Unicode | ✅ done — against a fixture this repo writes |
+| — | The window: an icon, a toolbar, the system font, and a scaled display | ✅ done — no build script, no dependency |
 
-49 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
-the public fixtures from freepst, fetched by `tests\fetch-fixtures.ps1`. Test files are
-not committed, because real PSTs contain real mail; the tests skip rather than fail when
-they are absent.
+65 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
+the public fixtures from freepst, fetched by `tests\fetch-fixtures.ps1` — plus a synthetic
+ANSI PST, since no public one exists. Test files are not committed, because real PSTs
+contain real mail; the tests skip rather than fail when they are absent.
+
+## What is left
+
+Nothing on this list is promised, and each of them is blocked on the same thing: a file
+nobody has yet handed over.
+
+| | Next | What it needs |
+|---|---|---|
+| 17 | Attachments proven against a real one | Any PST with an attachment in it |
+| 18 | ANSI proven against a file Outlook 97 wrote | One real ANSI `.pst` |
+| 19 | Where FMap and FPMap pages recur, settled rather than worked around | A PST over 125MB written by Outlook |
+| 20 | A rebuild opened by Outlook rather than by libpff | A machine with Outlook on it |

@@ -19,9 +19,12 @@ pstfree - read, export and repair Outlook PST/OST files
   pstfree <file.pst> --tree     the folder tree, with names and message counts
   pstfree <file.pst> --list     every message: date, folder, sender, subject
   pstfree <file.pst> --props <nid>   every property on one node, as stored
-  pstfree <file.pst> --export <dir> [--format eml|mbox|msg]   write the mail out
+  pstfree <file.pst> --find <text>   every message mentioning it, anywhere
+  pstfree <file.pst> --export <dir> [--format eml|mbox|msg] [--folder <name>]
+                                     write the mail out, all of it or one folder
   pstfree <file.pst> --rebuild <out.pst>   write a clean copy with a fresh index
   pstfree <file.ost> --rebuild <out.pst>   convert an OST into a PST
+  pstfree <ansi.pst> --rebuild <out.pst>   convert an Outlook 97-2002 PST to Unicode
   pstfree <file.pst> --verify   check every checksum, and what a sweep would recover
   pstfree <file.pst> --nodes    every node in the file
   pstfree <file.pst> --blocks   every block in the file
@@ -107,10 +110,11 @@ fn main() {
                     );
                     if r.converted {
                         println!(
-                            "  Converted from an Outlook 2013 OST. Every block was decoded, \
-                             inflated and\n  laid out again as a PST stores them, so this is \
-                             a new file rather than a copy\n  of the old one — check it \
-                             against the original before deleting anything."
+                            "  Converted from {}. Every data stream was decoded and laid out \
+                             again as a\n  Unicode PST stores them, so this is a new file \
+                             rather than a copy of the old\n  one — check it against the \
+                             original before deleting anything.",
+                            r.source
                         );
                     }
                     for p in &r.problems {
@@ -162,8 +166,14 @@ fn main() {
                 },
                 None => export::Format::Eml,
             };
-            run_export(&mut pst, &nodes, args.get(2).map(String::as_str), fmt)
+            let only = args
+                .iter()
+                .position(|a| a == "--folder")
+                .and_then(|i| args.get(i + 1))
+                .map(String::as_str);
+            run_export(&mut pst, &nodes, args.get(2).map(String::as_str), fmt, only)
         }
+        Some("--find") => run_find(&mut pst, &nodes, args.get(2).map(String::as_str)),
         Some("--nodes") => {
             println!(
                 "{:>10}  {:<26} {:>10}  {:>18} {:>18}",
@@ -527,7 +537,60 @@ fn list(pst: &mut Pst, nodes: &[Node]) {
     }
 }
 
-fn run_export(pst: &mut Pst, nodes: &[Node], dir: Option<&str>, format: export::Format) {
+/// Every message mentioning something, wherever it is in the file.
+///
+/// The thing the paid tools call "advanced search". Subject, sender and body, one
+/// substring, case-insensitive — and it works on a file recovered by sweeping exactly as
+/// it works on an intact one, which is the only version of this feature worth having in a
+/// recovery tool.
+fn run_find(pst: &mut Pst, nodes: &[Node], want: Option<&str>) {
+    let Some(needle) = want.filter(|s| !s.trim().is_empty()) else {
+        eprintln!("--find needs something to look for, e.g. --find invoice");
+        std::process::exit(2);
+    };
+
+    let (folder, _, _) = folders(pst, nodes);
+    let hits = ltp::find(pst, nodes, needle, &mut bar("searched"));
+    if hits.is_empty() {
+        println!("No message in this file mentions \"{needle}\".");
+        return;
+    }
+
+    println!(
+        "{:<16}  {:<22}  {:<20}  {:<7}  subject",
+        "date", "folder", "from", "matched"
+    );
+    for h in &hits {
+        println!(
+            "{:<16}  {:<22}  {:<20}  {:<7}  {}",
+            h.date,
+            trim(
+                folder
+                    .get(&h.folder)
+                    .map(String::as_str)
+                    .unwrap_or("(no folder)"),
+                22
+            ),
+            trim(&h.sender, 20),
+            h.matched,
+            h.subject
+        );
+    }
+    // Said out loud because most hits match in the body, where nothing on the line above
+    // shows the search term at all — which looks like a bug until you know.
+    println!(
+        "\n{} message(s) mention \"{needle}\". --props <nid> reads any one of them in full.",
+        hits.len()
+    );
+}
+
+fn run_export(
+    pst: &mut Pst,
+    nodes: &[Node],
+    dir: Option<&str>,
+    format: export::Format,
+    only: Option<&str>,
+) {
     let Some(dir) = dir else {
         eprintln!("--export needs a directory to write into, e.g. --export .\\mail");
         std::process::exit(2);
@@ -541,6 +604,28 @@ fn run_export(pst: &mut Pst, nodes: &[Node], dir: Option<&str>, format: export::
     }
 
     let (names, _, _) = folders(pst, nodes);
+
+    // One folder and everything under it, when asked for. Matched on the name shown in
+    // --tree, or on a node id for the folders a damaged file has left unnamed.
+    let chosen;
+    let nodes = match only {
+        None => nodes,
+        Some(want) => {
+            let nid = names
+                .iter()
+                .find(|(_, name)| name.eq_ignore_ascii_case(want))
+                .map(|(nid, _)| *nid)
+                .or_else(|| u32::from_str_radix(want.trim_start_matches("0x"), 16).ok())
+                .filter(|nid| names.contains_key(nid));
+            let Some(nid) = nid else {
+                eprintln!("no folder called \"{want}\" in this file. --tree lists them.");
+                std::process::exit(1);
+            };
+            chosen = export::subtree(nodes, nid);
+            &chosen
+        }
+    };
+
     let st = export::export(pst, nodes, &names, root, format, &mut bar("written"));
 
     println!("{} message(s) written to {dir}", st.messages);

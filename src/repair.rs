@@ -73,10 +73,12 @@ pub struct Rebuilt {
     /// different sentences and only one of them is worth interrupting someone for.
     pub missing: Vec<String>,
     pub bytes: u64,
-    /// True when the source was an Outlook 2013 OST and this was a format conversion
+    /// True when the source was in a format a PST cannot hold and this was a conversion
     /// rather than a copy. Worth saying out loud: a repair cannot corrupt a property
     /// because it never looks at one, and a conversion has to take every block apart.
     pub converted: bool,
+    /// What it was converted from, for the sentence that says so. Empty otherwise.
+    pub source: &'static str,
     /// Anything that had to be done at a cost, named. Empty in the ordinary case.
     pub problems: Vec<String>,
 }
@@ -384,6 +386,7 @@ pub fn rebuild(
         missing,
         bytes: eof,
         converted: false,
+        source: "",
         problems: Vec::new(),
     })
 }

@@ -469,9 +469,13 @@ fn decode(ptype: u16, b: Vec<u8>) -> Value {
     };
     match ptype {
         0x001F => Value::Str(utf16le(&b)),
-        // PtypString8 is in the file's own code page, which is not recorded anywhere in
-        // the file. Treated as Latin-1: right for western text, and never a panic.
-        0x001E => Value::Str(b.iter().map(|&c| c as char).collect()),
+        // PtypString8 is in the file's own code page, which the file does not record.
+        // Read as windows-1252, which is Latin-1 with the 0x80–0x9F range filled in —
+        // the curly quotes, the em dash and the ellipsis that Word puts in a message.
+        // Latin-1 renders every one of those as a control character. It matters more
+        // than it used to: an ANSI PST has no PtypString in it at all, so this is every
+        // subject line and every sender name in an Outlook 97 archive.
+        0x001E => Value::Str(crate::html::decode(&b)),
         0x0040 => eight(&b)
             .map(Value::Time)
             .unwrap_or(Value::Raw { ptype, bytes: b }),
@@ -823,6 +827,104 @@ fn utf16le(b: &[u8]) -> String {
         .map(|c| u16::from_le_bytes(*c))
         .collect();
     String::from_utf16_lossy(&units)
+}
+
+/// The body of a message as text a person can read.
+///
+/// `PidTagBody` when the file has one; otherwise the HTML body with its markup taken off,
+/// which is the only body a great many messages have. The same caution as export applies
+/// and for the same reason: `PidTagHtml` does not always hold HTML — Outlook's own
+/// account-test message puts plain text in it — and running the markup stripper over
+/// prose would fold away the blank lines that are the only structure it has.
+pub fn body_text(pc: &Pc) -> Option<String> {
+    if let Some(b) = pc.str(PID_BODY) {
+        if !b.trim().is_empty() {
+            return Some(b.to_string());
+        }
+    }
+    let raw = match pc.props.get(&PID_BODY_HTML) {
+        Some(Value::Bytes(b)) => crate::html::decode(b),
+        Some(Value::Str(s)) => s.clone(),
+        _ => return None,
+    };
+    let text = if raw.contains('<') {
+        crate::html::to_text(&raw)
+    } else {
+        raw
+    };
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// One message that matched a search, with everything a list needs to show it.
+pub struct Hit {
+    pub node: Node,
+    /// The folder it is in, as a node id — the caller has the names.
+    pub folder: u32,
+    pub subject: String,
+    pub sender: String,
+    pub date: String,
+    /// Which field matched, so a result with nothing visibly matching in it — the usual
+    /// case, since most hits are in the body — does not look like a bug.
+    pub matched: &'static str,
+}
+
+/// Every message whose subject, sender or body contains `needle`, newest first.
+///
+/// The thing the $50 tools put on the box. It is a substring match over properties this
+/// layer already decodes, so it is a loop, not a feature: no index is built, nothing is
+/// cached, and a file that has just been recovered by sweeping is searched exactly like
+/// an intact one. Unreadable messages are skipped rather than aborting the search —
+/// the one in the middle of a damaged file that will not parse is not a reason to
+/// withhold the four hundred that will.
+///
+/// Case-insensitive, and that is the whole of the query language. No globs, no regex, no
+/// field syntax; those are all things somebody has to learn before the box works.
+pub fn find(pst: &mut Pst, nodes: &[Node], needle: &str, on: crate::Progress) -> Vec<Hit> {
+    let needle = needle.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+
+    let messages: Vec<&Node> = nodes.iter().filter(|n| n.nid_type() == 0x04).collect();
+    let total = messages.len() as u64;
+    let mut out = Vec::new();
+
+    for (i, n) in messages.into_iter().enumerate() {
+        on(i as u64 + 1, total);
+        let Ok(pc) = read_node_pc(pst, n) else {
+            continue;
+        };
+        let subject = clean_subject(pc.str(PID_SUBJECT).unwrap_or("(no subject)")).to_string();
+        let sender = pc.str(PID_SENDER_NAME).unwrap_or("").to_string();
+
+        // Body last, because it is the one that costs a markup strip, and most searches
+        // are for a person or a subject line.
+        let matched = if subject.to_lowercase().contains(&needle) {
+            "subject"
+        } else if sender.to_lowercase().contains(&needle) {
+            "sender"
+        } else if body_text(&pc).is_some_and(|b| b.to_lowercase().contains(&needle)) {
+            "body"
+        } else {
+            continue;
+        };
+
+        let when = pc
+            .time(PID_DELIVERY_TIME)
+            .or(pc.time(PID_SUBMIT_TIME))
+            .unwrap_or(0);
+        out.push(Hit {
+            node: *n,
+            folder: n.nid_parent,
+            subject,
+            sender,
+            date: filetime(when).trim().to_string(),
+            matched,
+        });
+    }
+
+    out.sort_by(|a, b| b.date.cmp(&a.date));
+    out
 }
 
 #[cfg(test)]

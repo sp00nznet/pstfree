@@ -1,6 +1,7 @@
-# OST to PST
+# OST to PST, and ANSI to Unicode
 
 `pstfree file.ost --rebuild out.pst`, or **File → Repair to a new .pst** in the window.
+The same command on an **ANSI PST** — Outlook 97 to 2002 — writes a modern Unicode one.
 
 This is the third of the three things the payware sells, after "PST Repair" and "PST
 Password Recovery", and it is the only one of them that involves real work. The password
@@ -22,6 +23,36 @@ because the two formats disagree about what a block is:
 
 So every block has to be decoded and inflated, and some of them are too big to be written
 back out as they came. Nothing survives the trip unchanged except the bytes themselves.
+
+## The ANSI case, which arrives here for a different reason
+
+An ANSI PST has none of that problem — nothing in it is compressed and its blocks are
+already small enough to fit. It cannot be copied either, for a reason that is almost the
+opposite: every id and offset in it is **32 bits**, and both its trailers put the id
+before the checksum rather than after it.
+
+| | ANSI PST | Unicode PST |
+|---|---|---|
+| ids and offsets | 32-bit | 64-bit |
+| header | 512 bytes, 40-byte ROOT | 564 bytes, 72-byte ROOT |
+| header checksums | partial only | partial **and** full |
+| block trailer | 12 bytes: cb, wSig, **bid, dwCRC** | 16 bytes: cb, wSig, **dwCRC, bid** |
+| page trailer | 12 bytes, entry array to 496 | 16 bytes, entry array to 488 |
+| NBTENTRY / BBTENTRY / BTENTRY | 16 / 12 / 12 bytes | 32 / 24 / 24 bytes |
+| subnode block header | 4 bytes | 8 bytes (four of padding) |
+| file size ceiling | **2GB** | none in practice |
+
+A block copied across would carry a trailer no Unicode reader can parse, and an index
+entry naming it would be half the width the page expects. So it takes the same door: the
+*contents* of a data stream are the same bytes in both formats, and only the plumbing
+around them has to be rewritten. That also lifts the 2GB ceiling, which is the other half
+of why anybody wants this particular conversion — an archive that has been bumping against
+it for twenty years stops doing so.
+
+The trailer field order is the trap worth naming. Read an ANSI trailer with the Unicode
+offsets and the checksum field holds the block id, so every block in the file reports as
+damaged and nothing in the error says why. It is the sort of difference that makes a
+reader look broken rather than unfinished.
 
 ## What it actually does
 

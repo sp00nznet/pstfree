@@ -12,9 +12,45 @@ promised.
   fixtures has any, so the code that pulls them out of the subnode tree is written and the
   MIME assembly around it is unit-tested, but the extraction itself has never run against
   real data. Treat it as unproven until a file with attachments turns up.
-- **The window shows plain text only.** A message with an HTML body and no plain-text one
-  says so rather than rendering it; export to read those. Rendering HTML means either
-  hosting a browser control or writing a layout engine, and neither belongs in a reader.
+- ~~**The window shows plain text only.**~~ **Settled, by deciding not to render.** A
+  message with only an HTML body is now read in the window like any other: the markup is
+  taken off and the text kept, with the line breaks the tags describe. Rendering it
+  properly would mean hosting a browser control — a whole other runtime, in a program
+  whose promise is that there is nothing to install — or writing a layout engine, which is
+  a larger project than reading PST files. What is knowingly lost is named in
+  `src/html.rs`: a table becomes its cells one after another, an image leaves only its
+  `alt` text, and a link keeps its text and loses its URL. The `.eml` export still carries
+  the markup intact, which is the answer for anyone who wants the message as it was sent.
+
+  One decision worth recording, because the obvious rule is wrong: a block-level tag ends
+  a line only when there is something on it. Treating every `<p>`, `<div>` and `</div>`
+  as a line break turns real mail — which nests block tags five and six deep — into a page
+  of blank lines. An explicit `<br>` always breaks, because somebody typed it.
+
+- **ANSI PST support has never seen a file Outlook wrote.** Outlook 97–2002 files read,
+  export and convert, and the format differences are all covered: the 512-byte header with
+  its 40-byte ROOT, 32-bit ids and offsets, 12-byte trailers with the id **before** the
+  checksum rather than after it, a page footer at 496, a subnode block with no padding
+  after the count, and an XBLOCK id array half the usual width. But **no public ANSI PST
+  exists** — the same search that found no corpus of damaged files found no ANSI ones
+  either — so the fixture is one `tests/ansi.rs` writes itself from MS-PST 2.2.2.6 and
+  2.2.2.7.
+
+  That is better evidence than it sounds, because the file is written from the
+  specification's field order and read back by code that shares no constants with it, and
+  because every one of those differences fails loudly rather than quietly if it is wrong:
+  the trailer order shows up as every block failing its checksum, the entry widths as
+  garbage node ids, the subnode header as a tree read one field to the left. It is still
+  not the same claim as "a 1998 archive opens". If you have one, it is the single most
+  useful thing anybody could send this project.
+
+- ~~**`NDB_CRYPT_CYCLIC` is implemented but has never decoded a real file.**~~ Still true
+  of a real file, but it now decodes a whole synthetic one — `tests/ansi.rs` builds an
+  ANSI PST with every data block cyclically encoded and reads the contents back out. The
+  cipher is symmetric, so that is this project's encoder checked against its own decoder
+  and no more; what it does prove independently is that `bCryptMethod` is read from offset
+  461 in an ANSI header rather than 513, and that only data blocks are decoded — both
+  things that would otherwise fail silently.
 - **`.msg` output has never been opened by Outlook**, because there is no Outlook on the
   machine it was written on. The compound file underneath is verified by a reader written
   against the format and independently by 7-Zip, and the property streams follow MS-OXMSG
@@ -49,10 +85,6 @@ promised.
   print something that looked fine, and would not survive that. Nine well-known property
   sets are spelled out by name and the rest print as GUIDs. A file that has lost node
   `0x61` still lists its properties, and says why they have no labels.
-- **`NDB_CRYPT_CYCLIC` is implemented but has never decoded a real file.** No fixture uses
-  it. The specification calls it a symmetric cipher and the test checks that running it
-  twice returns the original bytes, which is the only evidence behind it. Permute is
-  verified against real files and can be trusted; cyclic cannot be, yet.
 - **NID types `0x14`–`0x19` are not in MS-PST**, which lists them as unallocated. The test
   OST is full of them — 40 of type `0x14` and 39 of `0x15` in a file with 40 folders, so
   roughly one of each per folder. Best guess is the sync engine's per-folder state, which
