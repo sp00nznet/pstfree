@@ -298,21 +298,49 @@ fn tidy(s: &str) -> String {
 /// Bytes out of a PST that are text in some code page — `PidTagHtml`, or any
 /// `PtypString8` property — as a `String`.
 ///
-/// The file stores them in whatever code page it was written with and does not reliably
-/// record which, and this project carries no character-set library. UTF-8 is tried first
-/// because it is what most of the last fifteen years of mail is; anything else is read as
-/// windows-1252, which is iso-8859-1 with the 0x80–0x9F range filled in — the curly
-/// quotes and dashes Word puts in a message, and the bytes that are otherwise simply
-/// wrong rather than merely odd.
-///
-// ponytail: two encodings, not a charset library. A shift_jis or gbk body decodes as
-// mojibake here and correctly in an exported .eml, which declares the real charset. Add a
-// decoder if a file ever turns up where that matters.
-pub fn decode(bytes: &[u8]) -> String {
-    match std::str::from_utf8(bytes) {
-        Ok(s) => s.to_string(),
-        Err(_) => bytes.iter().map(|&b| cp1252(b)).collect(),
+/// `codepage` is what the message says it was written in, when it says:
+/// `PidTagInternetCodepage` for the HTML body, `PidTagMessageCodepage` for the narrow
+/// strings. UTF-8 is still tried first, because a declaration is often wrong in that one
+/// direction — an HTML body carries its own `<meta charset>` and the property beside it
+/// says 1252 — while Shift-JIS or GBK bytes are almost never valid UTF-8 by accident.
+/// Then the declared code page, decoded by Windows, which already knows every one of
+/// them; then windows-1252, which is iso-8859-1 with the 0x80–0x9F range filled in — the
+/// curly quotes and dashes Word puts in a message.
+pub fn decode(bytes: &[u8], codepage: Option<u32>) -> String {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
     }
+    match codepage {
+        // 1252 and its subsets are the fallback below; 1200/1201 are UTF-16, which is
+        // never what a narrow string holds whatever the property claims.
+        Some(cp) if !matches!(cp, 0 | 1200 | 1201 | 1252 | 20127 | 28591 | 65001) => {
+            windows(bytes, cp).unwrap_or_else(|| bytes.iter().map(|&b| cp1252(b)).collect())
+        }
+        _ => bytes.iter().map(|&b| cp1252(b)).collect(),
+    }
+}
+
+/// `MultiByteToWideChar`, refusing rather than guessing: an invalid sequence or a code
+/// page this machine does not have is `None`, so the caller falls back instead of
+/// showing a page of U+FFFD.
+fn windows(bytes: &[u8], cp: u32) -> Option<String> {
+    use windows_sys::Win32::Globalization::{MultiByteToWideChar, MB_ERR_INVALID_CHARS};
+    let len = i32::try_from(bytes.len()).ok()?;
+    let flags = MB_ERR_INVALID_CHARS;
+    // Some code pages (the ISO-2022 and 5x-family ones) reject every flag.
+    let call = |flags, out: *mut u16, n| unsafe {
+        MultiByteToWideChar(cp, flags, bytes.as_ptr(), len, out, n)
+    };
+    let (flags, n) = match call(flags, std::ptr::null_mut(), 0) {
+        0 => (0, call(0, std::ptr::null_mut(), 0)),
+        n => (flags, n),
+    };
+    if n <= 0 {
+        return None;
+    }
+    let mut wide = vec![0u16; n as usize];
+    let n = call(flags, wide.as_mut_ptr(), n);
+    (n > 0).then(|| String::from_utf16_lossy(&wide[..n as usize]))
 }
 
 fn cp1252(b: u8) -> char {
@@ -393,9 +421,24 @@ mod tests {
 
     #[test]
     fn decode_prefers_utf8_and_falls_back_to_cp1252() {
-        assert_eq!(decode("don’t".as_bytes()), "don’t");
+        assert_eq!(decode("don’t".as_bytes(), None), "don’t");
         // The same apostrophe as a single windows-1252 byte, which is not valid UTF-8.
-        assert_eq!(decode(b"don\x92t"), "don’t");
-        assert_eq!(decode(b"\x80"), "€");
+        assert_eq!(decode(b"don\x92t", None), "don’t");
+        assert_eq!(decode(b"\x80", Some(1252)), "€");
+    }
+
+    #[test]
+    fn decode_honours_the_declared_code_page() {
+        // 日本語 in Shift-JIS and in GBK: the two a Western default turns into mojibake.
+        assert_eq!(decode(b"\x93\xfa\x96\x7b\x8c\xea", Some(932)), "日本語");
+        assert_eq!(decode(b"\xc8\xd5\xb1\xbe\xd3\xef", Some(936)), "日本语");
+        // Κύριε in windows-1253: a single-byte page that is not 1252.
+        assert_eq!(decode(b"\xca\xfd\xf1\xe9\xe5", Some(1253)), "Κύριε");
+        // A code page this machine does not have falls back rather than failing. One it
+        // does have is trusted: Windows maps even Shift-JIS's undefined bytes to
+        // something rather than refusing them, so a declaration is not second-guessed.
+        assert_eq!(decode(b"caf\xe9", Some(12345)), "café");
+        // UTF-8 still wins over a declaration, because declarations lie that way round.
+        assert_eq!(decode("日本語".as_bytes(), Some(1252)), "日本語");
     }
 }

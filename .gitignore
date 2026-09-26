@@ -10,3 +10,9 @@ tests/cases/
 *.eml
 *.msg
 *.mbox
+
+# Third-party material kept beside the repo for testing, never in it: the CMU Enron
+# maildir tarball (and anything unpacked from it) and papers read along the way.
+*.pdf
+*.tar.gz
+maildir/

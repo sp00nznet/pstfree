@@ -107,7 +107,97 @@ promised.
   While the file's own index is readable it settles all of this, and warning then would
   be crying wolf over a healthy file.
 
+## The Enron corpus, and what it can and cannot test
+
+The CMU Enron release (`enron_mail_20150507.tar.gz`, 1.7GB unpacked) was the obvious big
+dataset to throw at this, and it is worth writing down exactly what it is before it gets
+mistaken for a PST corpus. Every one of its 517,401 messages was surveyed straight out of
+the tarball:
+
+| | |
+|---|---|
+| Container | Maildir: one RFC 5322 text file per message. **No PST, no OST.** |
+| Where it came from | `X-FileName`: 352,254 from Lotus Notes `.nsf`, 161,001 from `.pst`, 4,143 unknown |
+| Attachments | None — stripped, per the release notes |
+| Charset declared | `us-ascii` on every single message; 90 files hold any byte over 0x7F |
+| `Message-ID` | Every one minted by the conversion (`…JavaMail.evans@thyme`), not the original |
+| `Received`, transport headers, signatures | None, on any message |
+
+So it unblocks **none** of milestones 17–20: there is no PST in it to read, no attachment,
+no ANSI file and nothing Outlook wrote. It cannot exercise the code page work either,
+because the conversion flattened everything to ASCII. What it *is* good for is volume —
+half a million real messages with real subjects, senders and bodies — which is exactly
+what the three fixtures lack, and what a search, an export or a rebuild at mailbox scale
+needs. Using it that way means building PSTs out of it, which is a separate piece of work
+(see the roadmap), and the result would be a PST this project wrote, not one Outlook did.
+
+### Could this tool settle whether the corpus is authentic?
+
+Two papers by Kenji Nakamura ("Serious Doubt on the Authenticity of the Enron Email
+Corpus", 2024, and a 2026 follow-up) argue that because a July 2000 thread discusses
+impersonation, any message in the corpus might be forged. The thread is in the tarball at
+`maildir/cash-m/all_documents/792.` and reads plainly. Two separate things are in it:
+
+1. An anonymous complaint about the review process was sent from a **shared role
+   mailbox** — "Office of the Chairman@ECT" — and legal wanted to know who had access to
+   it. That is somebody with access to a group mailbox, not a forged header.
+2. Michelle Cash had heard that someone could "hack into the emeet site and pretend to be
+   Jeff Skilling". eMeet was an intranet discussion board (the corpus links it as
+   `eThink/eMeet.nsf`, a Notes database), not the mail system.
+
+Neither is evidence that the corpus misrepresents the mailboxes it was collected from.
+That a sender line could be falsified in 2000 was true of all email everywhere, and a
+corpus recording its own organisation worrying about it is, if anything, a sign it was not
+sanitised. The papers run two different questions together: *could a given message have
+been sent by someone other than its named sender* (yes, for any mail of that era) and *is
+the collection a faithful copy of what was seized* (a chain-of-custody question, which no
+header can answer).
+
+**Can pstfree prove it either way? No, and not for want of a feature.** The CMU release
+has had everything that could bear on it removed: no transport headers, no `Received`
+chain, the original Message-IDs replaced, times rewritten into the converter's time zone.
+Nor was there anything cryptographic to lose — DKIM did not exist until 2007, and internal
+Notes or Exchange mail never carried a signature. There is nothing left in the file for
+any tool to check.
+
+What *would* be in reach, given an original custodian PST: MAPI records more about how a
+message was sent than any maildir does. `PidTagSenderName` beside
+`PidTagSentRepresentingName` is exactly the "sent on behalf of a shared mailbox" case
+above; `PidTagTransportMessageHeaders` holds the `Received` chain for anything that came
+from outside; `PidTagCreatorName` and `PidTagLastModifierName` say who made the item and
+who last changed it. Showing those side by side is a provenance view, and a reasonable
+feature — it shows the evidence the file holds rather than delivering a verdict. For
+modern mail, checking a DKIM signature on an exported message is possible in principle
+with nothing but Windows (`BCrypt` for RSA, `DnsQuery` for the key), but keys get rotated
+and retired, so an old genuine message routinely fails. A tool that stamped "not
+authentic" on it would be wrong in the direction that hurts people. That part is a bridge
+too far.
+
 ## Resolved along the way
+
+- **Narrow text is decoded in the code page the message declares.** Every `PtypString8`
+  property — all of them, in an ANSI PST — and every HTML body used to be read as UTF-8
+  or else windows-1252, so a Japanese or Chinese message came out as mojibake in the
+  window and in search while its exported `.eml` was fine. The file does say which code
+  page: `PidTagMessageCodepage` (`0x3FFD`) on the message for its narrow strings,
+  `PidTagInternetCodepage` (`0x3FDE`) for the HTML body. Windows already knows every code
+  page there is, so `MultiByteToWideChar` decodes them and no character-set library came
+  in. UTF-8 is still tried first, because declarations are wrong in that direction often
+  (an HTML body whose `<meta>` says UTF-8 beside a property that says 1252) and Shift-JIS
+  or GBK bytes are almost never valid UTF-8 by accident.
+
+  What did not work out as expected: `MB_ERR_INVALID_CHARS` rejects far less than its
+  name suggests. Windows maps even the bytes Shift-JIS leaves undefined to *something*,
+  and a lead byte with nothing after it becomes 「・」. So a declared code page is trusted
+  rather than cross-checked, and the fallback to windows-1252 is only for a code page the
+  machine does not have. Table rows — the recipient list is the one that matters — carry
+  no code page column and still get UTF-8-or-1252.
+
+- **Search runs off the message loop.** The window used to search on the message loop
+  itself, behind a wait cursor, which was instant on the fixtures and would have frozen
+  the window for minutes on a real mailbox. It is a job now, like export and repair: it reopens the
+  file on a worker, reports progress in the status bar, and hands its hits back to the
+  list when it is done.
 
 - **Converting an OST does not mean patching block references, it means not keeping any.**
   The first plan was to copy blocks across and re-split only the ones too big for a PST,

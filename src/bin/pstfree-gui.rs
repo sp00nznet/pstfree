@@ -71,8 +71,8 @@ const GLYPHS: [&[u8]; 5] = [
 /// somebody reading a bug report can find it.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// A long job posts these back; both carry a boxed `String` the handler takes ownership
-/// of. Posting is the one thing Windows lets another thread do to a window, so the job
+/// A long job posts these back: progress as a boxed `String`, the end as a boxed `Done`,
+/// and the handler takes ownership of either. Posting is the one thing Windows lets another thread do to a window, so the job
 /// runs off the message loop and the window keeps painting while it does.
 const WM_JOB_PROGRESS: u32 = WM_APP + 1;
 const WM_JOB_DONE: u32 = WM_APP + 2;
@@ -83,12 +83,38 @@ const WM_JOB_DONE: u32 = WM_APP + 2;
 struct Poster(HWND);
 unsafe impl Send for Poster {}
 
+/// What a finished job hands back to the window.
+enum Done {
+    /// Something to say, in the status bar and a message box.
+    Text(String),
+    /// A search: the needle it was run for, and what it found.
+    Found(String, Vec<pstfree::ltp::Hit>),
+}
+
 impl Poster {
     /// Hand the window a string and give up ownership of it; the handler takes it back.
     /// Taken by value so the whole handle moves into a worker, rather than the raw
     /// pointer inside it, which is the part that is not `Send`.
-    fn say(self, m: u32, text: String) {
-        unsafe { PostMessageW(self.0, m, 0, Box::into_raw(Box::new(text)) as LPARAM) };
+    fn say(self, text: String) {
+        unsafe {
+            PostMessageW(
+                self.0,
+                WM_JOB_PROGRESS,
+                0,
+                Box::into_raw(Box::new(text)) as LPARAM,
+            )
+        };
+    }
+
+    fn done(self, done: Done) {
+        unsafe {
+            PostMessageW(
+                self.0,
+                WM_JOB_DONE,
+                0,
+                Box::into_raw(Box::new(done)) as LPARAM,
+            )
+        };
     }
 }
 
@@ -256,20 +282,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
-        // Both carry a String the worker boxed and gave up ownership of.
+        // Both carry something the worker boxed and gave up ownership of.
         WM_JOB_PROGRESS => {
             let text = *Box::from_raw(lp as *mut String);
             set_status(hwnd, &text);
             0
         }
         WM_JOB_DONE => {
-            let text = *Box::from_raw(lp as *mut String);
+            let done = *Box::from_raw(lp as *mut Done);
             let app = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
-            if !app.is_null() {
-                (*app).busy = false;
+            if app.is_null() {
+                return 0;
             }
-            set_status(hwnd, &text.replace('\n', " "));
-            message_box(hwnd, &text, "pstfree", MB_ICONINFORMATION);
+            (*app).busy = false;
+            match done {
+                Done::Text(text) => {
+                    set_status(hwnd, &text.replace('\n', " "));
+                    message_box(hwnd, &text, "pstfree", MB_ICONINFORMATION);
+                }
+                Done::Found(needle, hits) => show_hits(hwnd, &mut *app, &needle, &hits),
+            }
             0
         }
         WM_DESTROY => {
@@ -1203,7 +1235,7 @@ unsafe fn do_export(hwnd: HWND, app: &mut App, format: Format, scope: Scope) {
         if st.failed > 0 {
             msg += &format!("\n{} could not be written.", st.failed);
         }
-        msg
+        Done::Text(msg)
     });
 }
 
@@ -1227,49 +1259,51 @@ unsafe fn do_rebuild(hwnd: HWND, app: &mut App) {
 
     spawn_job(hwnd, app, "Repairing", move |pst, nodes, on| {
         let blocks = index_blocks(pst);
-        match pstfree::repair::rebuild(pst, &nodes, &blocks, &out, on) {
-            Err(e) => format!("Nothing was written.\n\n{e}"),
-            Ok(r) => {
-                let mut msg = format!(
-                    "Wrote {out}\n\n{} node(s), {} block(s), {} bytes.",
-                    r.nodes, r.blocks, r.bytes
-                );
-                if r.converted {
-                    msg += &format!(
-                        "\n\nConverted from {}. Every data stream was decoded and laid out \
+        Done::Text(
+            match pstfree::repair::rebuild(pst, &nodes, &blocks, &out, on) {
+                Err(e) => format!("Nothing was written.\n\n{e}"),
+                Ok(r) => {
+                    let mut msg = format!(
+                        "Wrote {out}\n\n{} node(s), {} block(s), {} bytes.",
+                        r.nodes, r.blocks, r.bytes
+                    );
+                    if r.converted {
+                        msg += &format!(
+                            "\n\nConverted from {}. Every data stream was decoded and laid out \
                          again as a Unicode PST stores them, so this is a new file rather \
                          than a copy of the old one — check it against the original before \
                          deleting anything.",
-                        r.source
-                    );
-                }
-                for p in &r.problems {
-                    msg += &format!("\n\n{p}");
-                }
-                if r.dropped_blocks > 0 || r.dropped_nodes > 0 {
-                    msg += &format!(
-                        "\n\nLeft out {} block(s) that failed their own checksum, and {} \
+                            r.source
+                        );
+                    }
+                    for p in &r.problems {
+                        msg += &format!("\n\n{p}");
+                    }
+                    if r.dropped_blocks > 0 || r.dropped_nodes > 0 {
+                        msg += &format!(
+                            "\n\nLeft out {} block(s) that failed their own checksum, and {} \
                          node(s) whose data they held.",
-                        r.dropped_blocks, r.dropped_nodes
-                    );
-                }
-                if r.missing.is_empty() {
-                    msg += "\n\nThe allocation maps go out marked invalid, which is the \
+                            r.dropped_blocks, r.dropped_nodes
+                        );
+                    }
+                    if r.missing.is_empty() {
+                        msg += "\n\nThe allocation maps go out marked invalid, which is the \
                             documented way to say 'rebuild these before writing'. Outlook \
                             does that on open, and reopening the file here will report \
                             that one thing on purpose.";
-                } else {
-                    msg += &format!(
-                        "\n\nThis file will NOT open: it has no {}. That node's data block \
+                    } else {
+                        msg += &format!(
+                            "\n\nThis file will NOT open: it has no {}. That node's data block \
                          did not survive, and no index can point at bytes that are gone. \
                          pstfree still reads the result, so export is the way to get this \
                          mail out.",
-                        r.missing.join(", no ")
-                    );
+                            r.missing.join(", no ")
+                        );
+                    }
+                    msg
                 }
-                msg
-            }
-        }
+            },
+        )
     });
 }
 
@@ -1280,14 +1314,11 @@ unsafe fn do_rebuild(hwnd: HWND, app: &mut App) {
 /// showing and the Folder column is what says where each one came from; picking a folder
 /// in the tree puts the ordinary view back.
 ///
-// ponytail: this runs on the message loop behind a wait cursor, because it is a loop over
-// properties already decoded and it finishes instantly on anything the fixtures contain.
-// A mailbox-sized file will make the window pause. Move it to `spawn_job` when somebody
-// has one — that needs the job to hand results back rather than a string, which is the
-// only reason it is not there already.
+/// A job like export and repair, because on a real mailbox it is: a body search reads
+/// every message in the file, and 500,000 of them is minutes, not the instant the three
+/// fixtures made it look like.
 unsafe fn do_find(hwnd: HWND, app: &mut App) {
-    if app.pst.is_none() {
-        message_box(hwnd, "Open a file first.", "pstfree", MB_ICONINFORMATION);
+    if !ready(hwnd, app) {
         return;
     }
 
@@ -1300,13 +1331,15 @@ unsafe fn do_find(hwnd: HWND, app: &mut App) {
         return;
     }
 
-    set_status(hwnd, &format!("Searching for \"{needle}\"..."));
-    let wait = SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_WAIT));
-    let nodes = std::mem::take(&mut app.nodes);
-    let hits = pstfree::ltp::find(app.pst.as_mut().unwrap(), &nodes, &needle, &mut |_, _| {});
-    app.nodes = nodes;
-    SetCursor(wait);
+    spawn_job(hwnd, app, "Searching", move |pst, nodes, on| {
+        let hits = pstfree::ltp::find(pst, &nodes, &needle, on);
+        Done::Found(needle, hits)
+    });
+}
 
+/// A finished search, into the list. The hits' nodes came from the worker's own index on
+/// the same file, so they are the ones the window's handle would have found.
+unsafe fn show_hits(hwnd: HWND, app: &mut App, needle: &str, hits: &[pstfree::ltp::Hit]) {
     SendMessageW(app.list, LVM_DELETEALLITEMS, 0, 0);
     app.shown.clear();
     app.folder = 0;
@@ -1411,7 +1444,7 @@ unsafe fn ready(hwnd: HWND, app: &App) -> bool {
 /// so a second handle costs nothing and removes every question about sharing the first.
 unsafe fn spawn_job<F>(hwnd: HWND, app: &mut App, label: &'static str, job: F)
 where
-    F: FnOnce(&mut Pst, Vec<Node>, pstfree::Progress) -> String + Send + 'static,
+    F: FnOnce(&mut Pst, Vec<Node>, pstfree::Progress) -> Done + Send + 'static,
 {
     let post = Poster(hwnd);
     let path = app.path.clone();
@@ -1423,7 +1456,7 @@ where
     // that is the whole of the cost.
     std::thread::spawn(move || {
         let done = match load(&path) {
-            Err(e) => format!("{path} could not be reopened for this: {e}"),
+            Err(e) => Done::Text(format!("{path} could not be reopened for this: {e}")),
             Ok((mut pst, nodes, _)) => {
                 // Throttled here rather than in the library: every tick is a window
                 // message, and a million of them would be the slow part of the job.
@@ -1433,12 +1466,12 @@ where
                     if now - last >= std::time::Duration::from_millis(150) {
                         last = now;
                         let pct = (a * 100).checked_div(b).unwrap_or(100);
-                        post.say(WM_JOB_PROGRESS, format!("{label}: {a} of {b} ({pct}%)"));
+                        post.say(format!("{label}: {a} of {b} ({pct}%)"));
                     }
                 };
                 job(&mut pst, nodes, &mut on)
             }
         };
-        post.say(WM_JOB_DONE, done);
+        post.done(done);
     });
 }

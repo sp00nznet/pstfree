@@ -27,16 +27,20 @@ Updated as things land. Nothing is claimed until it runs.
 | 15 | Export one folder or one message instead of all of it | ✅ done |
 | 16 | ANSI PST (Outlook 97–2002): read it, and convert it to Unicode | ✅ done — against a fixture this repo writes |
 | — | The window: an icon, a toolbar, the system font, and a scaled display | ✅ done — no build script, no dependency |
+| 21 | Search in the window without freezing it | ✅ done — a job, with progress, like export |
+| 22 | Every code page Windows knows, as the message declares it | ✅ done — `MultiByteToWideChar`, no charset library |
 
-65 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
+66 tests, verified against a real PST, a real 2013 OST and a real password-protected PST —
 the public fixtures from freepst, fetched by `tests\fetch-fixtures.ps1` — plus a synthetic
 ANSI PST, since no public one exists. Test files are not committed, because real PSTs
 contain real mail; the tests skip rather than fail when they are absent.
 
 ## What is left
 
-Nothing on this list is promised, and each of them is blocked on the same thing: a file
-nobody has yet handed over.
+Nothing on this list is promised. The first four are blocked on the same thing: a file
+nobody has yet handed over. The CMU Enron corpus looked like it might be that file and is
+not — it is maildir text, with no PST, no attachment and nothing Outlook wrote in it. See
+[findings](findings.md#the-enron-corpus-and-what-it-can-and-cannot-test).
 
 | | Next | What it needs |
 |---|---|---|
@@ -44,3 +48,5 @@ nobody has yet handed over.
 | 18 | ANSI proven against a file Outlook 97 wrote | One real ANSI `.pst` |
 | 19 | Where FMap and FPMap pages recur, settled rather than worked around | A PST over 125MB written by Outlook |
 | 20 | A rebuild opened by Outlook rather than by libpff | A machine with Outlook on it |
+| 23 | Build a PST out of a maildir, to test search, export and rebuild at 500,000 messages | Nothing but the work: the Enron corpus is the input. The result is a PST this project wrote, so it tests scale and not compatibility |
+| 24 | A provenance view: sender beside sent-on-behalf-of, the `Received` chain, creator and last modifier | Nothing but the work. Shows the evidence a message carries; does not claim to judge it |

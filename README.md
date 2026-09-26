@@ -18,6 +18,11 @@ folder or one message** instead of all of it; rich-text messages **readable in t
 rather than only after export; and **Outlook 97–2002 ANSI files**, which used to be refused
 outright and now open, export and convert to the modern format.
 
+New in v0.5.0: search in the window **no longer freezes it** on a big mailbox — it runs in
+the background with a progress count, like export and repair — and Japanese, Chinese,
+Greek, Cyrillic and every other **code page Windows knows** now reads correctly in the
+window and in search, instead of only in an export.
+
 **[Download the two executables](https://github.com/sp00nznet/pstfree/releases/latest)** —
 no installer, no runtime, nothing to build. Or build it yourself, it takes one command.
 
@@ -225,13 +230,19 @@ Stated plainly, because a repair tool that overstates itself is the thing this r
 - **Cyclic encoding has never decoded a real file** — no fixture uses it.
 - **Recovery has only been tested against damage this repo inflicted itself.** There is no
   public corpus of broken PSTs; every route was checked and none exists.
+- **The Enron corpus does not change any of the above.** The CMU release is 517,401
+  messages of maildir text converted out of Notes and Outlook, with attachments stripped
+  and every message flattened to ASCII — no PST in it, and nothing Outlook wrote. What it
+  can and cannot test, and why no tool can settle the recent argument about its
+  authenticity from that release, is in
+  [findings](docs/findings.md#the-enron-corpus-and-what-it-can-and-cannot-test).
 
 The full list, including the places the first reading of the spec was wrong, is in
 [docs/findings.md](docs/findings.md).
 
 ## How it is tested
 
-65 tests, against a real PST, a real 2013 OST and a real password-protected PST — the
+66 tests, against a real PST, a real 2013 OST and a real password-protected PST — the
 public fixtures from [freepst], fetched by `tests\fetch-fixtures.ps1` — plus an ANSI PST
 this repo builds itself, because there is no public one to fetch. Test files are never
 committed, because real PSTs contain real mail; the tests skip rather than fail when they
@@ -286,6 +297,13 @@ cargo test
 Same method every time: read the published spec, call the OS API that is
 already there, ship one executable, MIT. Why that is worth doing at all is
 written down in **[PHILOSOPHY.md](PHILOSOPHY.md)**.
+
+## Tip jar
+
+pstfree is free and staying that way: no trial, no locked features, no nag screen.
+If it got your mail back and you'd like to say thanks, you can
+[leave a tip](https://buy.stripe.com/00w14h8Gn5yg7MN8l0fMA02). Pay whatever you like;
+the suggested amount is just a suggestion. A star or a good bug report helps just as much.
 
 ## Licence
 

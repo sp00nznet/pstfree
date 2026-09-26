@@ -44,6 +44,7 @@ pub const PID_DISPLAY_CC: u16 = 0x0E03;
 pub const PID_BODY: u16 = 0x1000;
 pub const PID_BODY_HTML: u16 = 0x1013;
 pub const PID_INTERNET_CODEPAGE: u16 = 0x3FDE;
+pub const PID_MESSAGE_CODEPAGE: u16 = 0x3FFD;
 pub const PID_INTERNET_MSG_ID: u16 = 0x1035;
 pub const PID_ATTACH_DATA: u16 = 0x3701;
 pub const PID_ATTACH_FILENAME: u16 = 0x3704;
@@ -415,6 +416,9 @@ pub fn read_pc(pst: &mut Pst, bid_data: u64, bid_sub: u64) -> Result<Pc, String>
     let mut from_subnode = 0;
 
     let mut props = BTreeMap::new();
+    // PtypString8 values wait until every property is read, because the one that says
+    // which code page they are in can come after them.
+    let mut narrow = Vec::new();
     for r in records {
         if r.len() < 8 {
             continue;
@@ -455,7 +459,18 @@ pub fn read_pc(pst: &mut Pst, bid_data: u64, bid_sub: u64) -> Result<Pc, String>
             }
         };
 
-        props.insert(id, decode(ptype, bytes));
+        if ptype == 0x001E {
+            narrow.push((id, bytes));
+        } else {
+            props.insert(id, decode(ptype, bytes));
+        }
+    }
+    let cp = match props.get(&PID_MESSAGE_CODEPAGE) {
+        Some(Value::Int(cp)) => u32::try_from(*cp).ok(),
+        _ => None,
+    };
+    for (id, bytes) in narrow {
+        props.insert(id, Value::Str(crate::html::decode(&bytes, cp)));
     }
     Ok(Pc {
         props,
@@ -469,13 +484,12 @@ fn decode(ptype: u16, b: Vec<u8>) -> Value {
     };
     match ptype {
         0x001F => Value::Str(utf16le(&b)),
-        // PtypString8 is in the file's own code page, which the file does not record.
-        // Read as windows-1252, which is Latin-1 with the 0x80–0x9F range filled in —
-        // the curly quotes, the em dash and the ellipsis that Word puts in a message.
-        // Latin-1 renders every one of those as a control character. It matters more
-        // than it used to: an ANSI PST has no PtypString in it at all, so this is every
-        // subject line and every sender name in an Outlook 97 archive.
-        0x001E => Value::Str(crate::html::decode(&b)),
+        // PtypString8 is in a code page. A property context reads its own
+        // PidTagMessageCodepage first and does not come through here for these; a table
+        // row has no such column, so it gets windows-1252 — Latin-1 with the 0x80–0x9F
+        // range filled in, the curly quotes and dashes Word puts in a message. It matters:
+        // an ANSI PST has no PtypString in it at all.
+        0x001E => Value::Str(crate::html::decode(&b, None)),
         0x0040 => eight(&b)
             .map(Value::Time)
             .unwrap_or(Value::Raw { ptype, bytes: b }),
@@ -843,7 +857,11 @@ pub fn body_text(pc: &Pc) -> Option<String> {
         }
     }
     let raw = match pc.props.get(&PID_BODY_HTML) {
-        Some(Value::Bytes(b)) => crate::html::decode(b),
+        Some(Value::Bytes(b)) => crate::html::decode(
+            b,
+            pc.int(PID_INTERNET_CODEPAGE)
+                .and_then(|cp| u32::try_from(cp).ok()),
+        ),
         Some(Value::Str(s)) => s.clone(),
         _ => return None,
     };
