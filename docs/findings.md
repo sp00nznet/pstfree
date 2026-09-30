@@ -92,9 +92,10 @@ promised.
 - **Where FMap and FPMap pages actually recur is still not known**, and a rebuild now
   works around that rather than answering it — see below. Settling it needs a PST over
   125MB written by Outlook, which is the one thing no public corpus has.
-- **No rebuild of any size has been opened by Outlook**, large ones included. There is no
-  Outlook on the machine this was written on. libpff opens them and every block in them
-  re-reads and re-checksums, which is evidence, but it is not that claim.
+- **Outlook has opened a conversion once, and asked for SCANPST first.** Issue #1: a real
+  OST, converted, opened by the reporter in classic Outlook. It opened after SCANPST and
+  after the two store fixes below. The invalid allocation maps are what SCANPST was for;
+  writing valid ones is the open item. Large rebuilds have still never been opened.
 - **Encrypted OST.** Per MS-PST the encoding modes are keyless, but Microsoft 365 profiles
   can restrict a local cache in ways this repo hasn't tested. Needs a real sample.
 - **A node whose every surviving index entry is stale still recovers as an older
@@ -174,6 +175,27 @@ authentic" on it would be wrong in the direction that hurts people. That part is
 too far.
 
 ## Resolved along the way
+
+- **An OST's message store is not a PST's, and copying it was wrong twice over.** Found
+  by the first real user to open a conversion in Outlook
+  ([issue #1](https://github.com/sp00nznet/pstfree/issues/1)), traced with SCANPST,
+  MFCMAPI and PstPassword, and handed over with the fix already proven by hand:
+
+  | Store property | OST | PST Outlook wrote | Converted, before | Converted, now |
+  |---|---|---|---|---|
+  | `0x67FF` PidTagPstPassword | -1 | 0 | -1 → Outlook asks for a password | 0 |
+  | `0x35E0` PidTagIpmSubTreeEntryId | absent | → Top of Personal Folders | absent → SCANPST makes an empty one | → `Root - Mailbox\IPM_SUBTREE` |
+  | `0x35E3` wastebasket, `0x35E7` finder | absent | present | absent | → Deleted Items, → Finder |
+  | `0x3001` display name | empty | "Personal Folders" | empty | "Personal Folders" |
+
+  None of it showed up against libpff, which reads the folders by walking the tree from
+  the root and never asks the store where the mailbox starts. That is the whole
+  difference between "a reader opens it" and "Outlook opens it", in one table. The entry
+  id shape (four zero bytes, the store's record key, the node id) is checked against the
+  store in `dist-list.pst`, which Outlook wrote. Deleted Items is found by name and
+  otherwise taken to be the subtree's first-created folder; that fallback is a guess for
+  a non-English OST, and a wrong guess only means Outlook uses a different folder as its
+  wastebasket.
 
 - **Narrow text is decoded in the code page the message declares.** Every `PtypString8`
   property — all of them, in an ANSI PST — and every HTML body used to be read as UTF-8

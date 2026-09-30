@@ -95,8 +95,10 @@ Precisely one byte of a copied block changes: a block trailer carries `wSig`, co
 from the block's own offset and id, and the offset is what a rebuild moves. The length,
 the CRC over the data and the id all describe bytes that did not change, so they cross
 over untouched. The allocation maps go out marked `INVALID_AMAP`, which is not a fudge but
-the state MS-PST 2.6.1.3.7 defines for "rebuild these before writing" — Outlook does that
-on open. Their *slots* are still reserved, because a rebuild writes them at fixed offsets
+the state MS-PST 2.6.1.3.7 defines for "rebuild these before writing". In practice Outlook
+reports such a file as not closed properly and wants it repaired first, and SCANPST does
+that in seconds — learnt from issue #1, the first time a rebuild was opened in Outlook at
+all. Writing valid maps would remove that step; it is on the roadmap. Their *slots* are still reserved, because a rebuild writes them at fixed offsets
 and anything living there would be overwritten.
 
 The proof is not that pstfree can read what pstfree wrote, which proves nothing at all:

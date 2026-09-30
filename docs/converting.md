@@ -113,9 +113,18 @@ more subnodes than one SLBLOCK holds.
 
 ## What is not claimed
 
-- **No converted file has been opened by Outlook.** There is no Outlook on the machine
-  this was written on. libpff opens them and reads the same mail out; that is evidence,
-  and it is not that claim.
+- **A converted file has been opened by Outlook once, by somebody else** — the reporter of
+  [issue #1](https://github.com/sp00nznet/pstfree/issues/1), on a real customer's OST.
+  That found two things libpff never could, because libpff does not care about either:
+  the OST's store carries `PidTagPstPassword` as -1, which Outlook reads as a password,
+  and it carries no `PidTagIpmSubTreeEntryId` at all, since Exchange supplies that at run
+  time. So the store is now the one node rebuilt rather than copied — every property it
+  had, plus the entry ids MS-PST 2.4.3.1 requires, pointing at `Root - Mailbox\IPM_SUBTREE`,
+  its Deleted Items and `Root - Mailbox\Finder`, and a password of 0. The reporter proved
+  the subtree fix by hand in MFCMAPI before this code existed. The rebuilt build itself
+  has not yet been opened in Outlook; that is the next thing asked of them.
+- **Outlook still wants SCANPST first**, because the allocation maps go out marked
+  invalid and Outlook reads that as a file that was not closed properly.
 - **An OST's sync-state nodes come across.** NID types `0x14`–`0x19` are the OST's record
   of its conversation with a server and are meaningless in a PST — 83 of the 308 nodes in
   the test file. They are kept, because throwing away what you do not understand is the

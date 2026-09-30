@@ -23,6 +23,14 @@ the background with a progress count, like export and repair — and Japanese, C
 Greek, Cyrillic and every other **code page Windows knows** now reads correctly in the
 window and in search, instead of only in an export.
 
+**v0.5.1 is the first release shaped by somebody else's real recovery.** A technician
+converted a customer's OST — mail that had been deleted from the server — found pstfree
+was the one converter of several that kept the messages and the folder tree, got the mail
+back, and then traced exactly why Outlook did not like the result
+([issue #1](https://github.com/sp00nznet/pstfree/issues/1)). Both problems were in the
+converted store, and both are fixed: it no longer **asks for a password nobody set**, and
+Outlook now **opens straight into the recovered folders** instead of an empty mailbox.
+
 **[Download the two executables](https://github.com/sp00nznet/pstfree/releases/latest)** —
 no installer, no runtime, nothing to build. Or build it yourself, it takes one command.
 
@@ -215,9 +223,10 @@ Stated plainly, because a repair tool that overstates itself is the thing this r
   are kept because discarding what you do not understand is the wrong instinct in a
   recovery tool, and because nothing has shown they do any harm. 83 of the 308 nodes in
   the test OST are these.
-- **No rebuild has ever been opened by Outlook**, because there is no Outlook here. libpff
-  opens them and every block in them re-reads and re-checksums, which is evidence but is
-  not that claim.
+- **Outlook wants SCANPST run over a rebuild before it will open it.** The allocation
+  maps go out marked invalid, and Outlook reports that as a file not closed properly.
+  SCANPST fixes it in seconds. Writing valid maps would remove the step, and is next.
+  Known because a converted OST has now been opened in Outlook for real (see below).
 - **Where FMap and FPMap pages recur is still unknown.** A rebuild works around it instead
   of answering it — it keeps every slot the four map pages could occupy clear, in every
   section of the file, which costs 0.8% and cannot be wrong in the direction that destroys
@@ -242,7 +251,7 @@ The full list, including the places the first reading of the spec was wrong, is 
 
 ## How it is tested
 
-66 tests, against a real PST, a real 2013 OST and a real password-protected PST — the
+68 tests, against a real PST, a real 2013 OST and a real password-protected PST — the
 public fixtures from [freepst], fetched by `tests\fetch-fixtures.ps1` — plus an ANSI PST
 this repo builds itself, because there is no public one to fetch. Test files are never
 committed, because real PSTs contain real mail; the tests skip rather than fail when they

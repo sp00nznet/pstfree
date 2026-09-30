@@ -23,7 +23,7 @@ pstfree - read, export and repair Outlook PST/OST files
   pstfree <file.pst> --export <dir> [--format eml|mbox|msg] [--folder <name>]
                                      write the mail out, all of it or one folder
   pstfree <file.pst> --rebuild <out.pst>   write a clean copy with a fresh index
-  pstfree <file.ost> --rebuild <out.pst>   convert an OST into a PST
+  pstfree <file.ost> --convert <out.pst>   convert an OST into a PST (same as --rebuild)
   pstfree <ansi.pst> --rebuild <out.pst>   convert an Outlook 97-2002 PST to Unicode
   pstfree <file.pst> --verify   check every checksum, and what a sweep would recover
   pstfree <file.pst> --nodes    every node in the file
@@ -97,7 +97,7 @@ fn main() {
 
     match args.get(1).map(String::as_str) {
         Some("--verify") => verify(&mut pst, &nodes, &blocks),
-        Some("--rebuild") => {
+        Some("--rebuild" | "--convert") => {
             let Some(out) = args.get(2) else {
                 eprintln!("--rebuild needs somewhere to write, e.g. --rebuild fixed.pst");
                 std::process::exit(2);
@@ -130,9 +130,10 @@ fn main() {
                     if r.missing.is_empty() {
                         println!(
                             "  The allocation maps are marked invalid, which is the documented \
-                             way to say\n  'rebuild these before writing' — Outlook does that \
-                             on open. Reading the\n  new file back will report that one thing, \
-                             and it is meant to."
+                             way to say\n  'rebuild these before writing'. Outlook reports \
+                             such a file as not closed\n  properly: run SCANPST over it first, \
+                             which takes seconds. Reading the\n  new file back here will \
+                             report that one thing, and it is meant to."
                         );
                     } else {
                         // Handing back a file that silently will not open is the exact

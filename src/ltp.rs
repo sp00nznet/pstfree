@@ -160,7 +160,7 @@ fn u16le_at(b: &[u8], o: usize) -> Result<u16, String> {
 ///
 /// Depth is bounded by the header's own level count, so a damaged tree cannot be made to
 /// recurse forever.
-fn bth_records(heap: &Heap) -> Result<(usize, Vec<Vec<u8>>), String> {
+pub(crate) fn bth_records(heap: &Heap) -> Result<(usize, Vec<Vec<u8>>), String> {
     let h = heap.item(heap.user_root)?;
     if h.len() < 8 {
         return Err(format!("B-tree header is {} bytes, expected 8", h.len()));
@@ -382,7 +382,7 @@ pub struct Pc {
 
 /// Fixed-size types of four bytes or less are stored inline, where a reference would
 /// otherwise go. Everything else is a heap id, or a subnode id.
-fn is_inline(ptype: u16) -> bool {
+pub(crate) fn is_inline(ptype: u16) -> bool {
     matches!(ptype, 0x0000..=0x0004 | 0x000A | 0x000B)
 }
 

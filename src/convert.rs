@@ -37,6 +37,7 @@
 //! plain. The encoding is keyless and protects nothing — that is the whole argument of
 //! this project — so preserving it would be work in exchange for nothing.
 
+use crate::ltp::{bth_records, is_inline, read_node_pc, Heap, NID_ROOT_FOLDER};
 use crate::ndb::{crc32, Node, Pst};
 use crate::repair::{
     build_tree, pad, place_aligned, put16, put32, put64, sig, Rebuilt, AMAP_EVERY, AMAP_FIRST,
@@ -306,6 +307,202 @@ impl Out {
     }
 }
 
+/// The message store's properties that say where a PST's folders are. MS-PST 2.4.3.1
+/// makes three of them, the record key and the display name compulsory.
+const PID_RECORD_KEY: u16 = 0x0FF9;
+const PID_DISPLAY_NAME: u16 = 0x3001;
+const PID_VALID_FOLDER_MASK: u16 = 0x35DF;
+const PID_IPM_SUBTREE: u16 = 0x35E0;
+const PID_WASTEBASKET: u16 = 0x35E3;
+const PID_FINDER: u16 = 0x35E7;
+const PID_PST_PASSWORD: u16 = 0x67FF;
+/// The message store's node. MS-PST 2.4.1.
+const NID_MESSAGE_STORE: u32 = 0x21;
+
+/// Where a property's value lives: in the record itself, in the heap, or in a subnode.
+enum Hnid {
+    Inline(u32),
+    Heap(Vec<u8>),
+    Sub(u32),
+}
+
+/// An OST's message store, made into one a PST can be opened with.
+///
+/// An OST does not carry the store properties that say where the folders are, because
+/// Exchange hands them to Outlook at run time. A PST must carry them itself. Copied
+/// across as they were, the result has no `PidTagIpmSubTreeEntryId`, so SCANPST gives
+/// it an empty "Top of Personal Folders" and every recovered folder sits unseen beside
+/// that. The OST also stores `PidTagPstPassword` as -1, which in a PST is the checksum
+/// of a password nobody set, so Outlook asks for it. Both found by the first person to
+/// open a conversion in Outlook (issue #1), who also proved the fix by hand.
+///
+/// So the store is the one node rebuilt rather than copied: every property it had, then
+/// the three entry ids, a display name if it has none, the mask saying which of those
+/// are valid, and a password of 0.
+fn pst_store(pst: &mut Pst, nodes: &[Node], store: &Node) -> Result<Vec<u8>, String> {
+    let heap = Heap::new(pst.node_blocks(store.bid_data)?)?;
+    let (_, records) = bth_records(&heap)?;
+    let mut props = std::collections::BTreeMap::new();
+    for r in records.iter().filter(|r| r.len() >= 8) {
+        let (id, ptype) = (
+            u16::from_le_bytes([r[0], r[1]]),
+            u16::from_le_bytes([r[2], r[3]]),
+        );
+        let raw = u32::from_le_bytes([r[4], r[5], r[6], r[7]]);
+        let v = if is_inline(ptype) {
+            Hnid::Inline(raw)
+        } else if raw & 0x1F == 0 {
+            Hnid::Heap(heap.item(raw)?.to_vec())
+        } else {
+            Hnid::Sub(raw)
+        };
+        props.insert(id, (ptype, v));
+    }
+
+    let key = match props.get(&PID_RECORD_KEY) {
+        Some((_, Hnid::Heap(k))) if k.len() == 16 => k.clone(),
+        _ => return Err("the message store has no record key, so no folder can be named".into()),
+    };
+    // An entry id in a PST is four flag bytes, the store's record key, and a node id.
+    // Checked against the fixture Outlook wrote, whose IPM subtree id names node 0x8022.
+    let entry = |nid: u32| -> Hnid {
+        let mut e = vec![0u8; 4];
+        e.extend_from_slice(&key);
+        e.extend_from_slice(&nid.to_le_bytes());
+        Hnid::Heap(e)
+    };
+
+    let (subtree, wastebasket, finder) = special_folders(pst, nodes)?;
+    props.insert(PID_IPM_SUBTREE, (0x0102, entry(subtree)));
+    props.insert(PID_WASTEBASKET, (0x0102, entry(wastebasket)));
+    props.insert(PID_FINDER, (0x0102, entry(finder)));
+    // FOLDER_IPM_SUBTREE_VALID | FOLDER_IPM_WASTEBASKET_VALID | FOLDER_FINDER_VALID.
+    props.insert(PID_VALID_FOLDER_MASK, (0x0003, Hnid::Inline(0x89)));
+    props.insert(PID_PST_PASSWORD, (0x0003, Hnid::Inline(0)));
+    if !has_text(&props) {
+        let name: Vec<u8> = "Personal Folders"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        props.insert(PID_DISPLAY_NAME, (0x001F, Hnid::Heap(name)));
+    }
+    pc_heap(&props)
+}
+
+fn has_text(props: &std::collections::BTreeMap<u16, (u16, Hnid)>) -> bool {
+    matches!(props.get(&PID_DISPLAY_NAME), Some((_, Hnid::Heap(b))) if !b.is_empty())
+}
+
+/// The mailbox's IPM subtree, its Deleted Items, and its search root, as node ids.
+///
+/// An OST lays its folders out as Exchange does: the root holds "Root - Mailbox", which
+/// holds "IPM_SUBTREE" (the folders a person sees) and "Finder" (search folders). Those
+/// two names are Exchange's own and are not translated. Deleted Items is, so it is found
+/// by name first and otherwise taken to be the subtree's first-created folder, which is
+/// where Exchange and Outlook both put it.
+fn special_folders(pst: &mut Pst, nodes: &[Node]) -> Result<(u32, u32, u32), String> {
+    let folders: Vec<(u32, u32, String)> = nodes
+        .iter()
+        .filter(|n| n.nid_type() == 0x02 && n.nid != NID_ROOT_FOLDER)
+        .map(|n| {
+            let name = read_node_pc(pst, n)
+                .ok()
+                .and_then(|pc| pc.str(PID_DISPLAY_NAME).map(str::to_string))
+                .unwrap_or_default();
+            (n.nid, n.nid_parent, name)
+        })
+        .collect();
+    let child = |parent: u32, name: &str| {
+        folders
+            .iter()
+            .find(|(_, p, n)| *p == parent && n == name)
+            .map(|f| f.0)
+    };
+    let mailbox = child(NID_ROOT_FOLDER, "Root - Mailbox")
+        .ok_or("no \"Root - Mailbox\" folder under the root, so there is no mailbox to point at")?;
+    let subtree = child(mailbox, "IPM_SUBTREE").ok_or("no IPM_SUBTREE in the mailbox")?;
+    let finder = child(mailbox, "Finder").ok_or("no Finder folder in the mailbox")?;
+    // ponytail: English name, then lowest node id. A localised OST whose Deleted Items was
+    // not the first folder created lands on the wrong one; Outlook then just uses that
+    // folder as its wastebasket, and nothing is lost.
+    let wastebasket = child(subtree, "Deleted Items")
+        .or_else(|| {
+            folders
+                .iter()
+                .filter(|(_, p, _)| *p == subtree)
+                .map(|f| f.0)
+                .min()
+        })
+        .ok_or("the IPM subtree has no folders in it at all")?;
+    Ok((subtree, wastebasket, finder))
+}
+
+/// A property context in one heap block: the heap header, the B-tree header, its one
+/// leaf of records sorted by property id, the values, and the page map after them.
+/// Laid out as Outlook lays out a store — allocations back to back, the map straight
+/// after the last — so the one written here reads like the ones it wrote.
+fn pc_heap(props: &std::collections::BTreeMap<u16, (u16, Hnid)>) -> Result<Vec<u8>, String> {
+    let hid = |index: usize| (index as u32) << 5;
+    let mut leaf = Vec::new();
+    let mut values: Vec<&[u8]> = Vec::new();
+    for (id, (ptype, v)) in props {
+        let hnid = match v {
+            Hnid::Inline(x) | Hnid::Sub(x) => *x,
+            Hnid::Heap(b) if b.is_empty() => 0,
+            Hnid::Heap(b) => {
+                values.push(b);
+                hid(2 + values.len()) // 1 is the B-tree header, 2 the leaf
+            }
+        };
+        leaf.extend_from_slice(&id.to_le_bytes());
+        leaf.extend_from_slice(&ptype.to_le_bytes());
+        leaf.extend_from_slice(&hnid.to_le_bytes());
+    }
+    // BTHHEADER: signature, 2-byte keys, 6-byte entries, a leaf with nothing above it.
+    let mut bth = vec![0xB5, 2, 6, 0];
+    bth.extend_from_slice(&hid(2).to_le_bytes());
+
+    let mut out = vec![0u8; 12];
+    let mut offsets = Vec::new();
+    for a in [&bth[..], &leaf[..]].into_iter().chain(values) {
+        offsets.push(out.len() as u16);
+        out.extend_from_slice(a);
+    }
+    offsets.push(out.len() as u16);
+    if out.len() % 2 == 1 {
+        out.push(0);
+    }
+    let map = out.len();
+    out.extend_from_slice(&((offsets.len() - 1) as u16).to_le_bytes()); // cAlloc
+    out.extend_from_slice(&0u16.to_le_bytes()); // cFree
+    for o in &offsets {
+        out.extend_from_slice(&o.to_le_bytes());
+    }
+    if out.len() > MAX_DATA {
+        return Err(format!(
+            "the message store's properties come to {} bytes, more than one block holds",
+            out.len()
+        ));
+    }
+    // HNHDR: the map's offset, 0xEC, 0xBC for a property context, the B-tree header as
+    // the heap's root, and how full this one block is.
+    put16(&mut out, 0, map as u16);
+    out[2] = 0xEC;
+    out[3] = 0xBC;
+    put32(&mut out, 4, hid(1));
+    let fill = fill_level(MAX_DATA - out.len());
+    put32(&mut out, 8, fill as u32);
+    Ok(out)
+}
+
+/// How much room is left in a heap block, in the sixteen steps MS-PST 2.3.1.2 counts in.
+fn fill_level(free: usize) -> u8 {
+    const AT_LEAST: [usize; 15] = [
+        3584, 2560, 2048, 1792, 1536, 1280, 1024, 768, 512, 256, 128, 64, 32, 16, 8,
+    ];
+    AT_LEAST.iter().position(|&n| free >= n).unwrap_or(15) as u8
+}
+
 /// Write an OST or an ANSI PST out as a Unicode PST, node by node.
 pub fn convert(
     pst: &mut Pst,
@@ -337,7 +534,23 @@ pub fn convert(
         // A node whose data will not come out of the OST is left out and named, rather
         // than taking the whole conversion down with it. Its blocks may already be in the
         // output, unreferenced, which costs space and nothing else.
-        let built = match o.stream(pst, n.bid_data, &what) {
+        // The store of an OST is rebuilt rather than copied; see `pst_store`. An ANSI
+        // PST's store already is one, with a password its owner may have set.
+        let data = if n.nid == NID_MESSAGE_STORE && !ansi {
+            match pst_store(pst, &keep, n) {
+                Ok(heap) => o.block(&heap, false),
+                Err(e) => {
+                    o.problems.push(format!(
+                        "The message store was copied as it was, which Outlook will show as \
+                         an empty mailbox until SCANPST has been run over it: {e}"
+                    ));
+                    o.stream(pst, n.bid_data, &what)
+                }
+            }
+        } else {
+            o.stream(pst, n.bid_data, &what)
+        };
+        let built = match data {
             Ok(data) => o.subtree(pst, n.bid_sub, n.nid, 0).map(|sub| (data, sub)),
             Err(e) => Err(e),
         };
@@ -542,12 +755,15 @@ mod tests {
                 "node 0x{:X} changed parent",
                 n.nid
             );
-            assert_eq!(
-                stream(&mut ost, n.bid_data),
-                stream(&mut pst, m.bid_data),
-                "node 0x{:X} holds different bytes",
-                n.nid
-            );
+            // The store is the one node rebuilt on purpose; it has a test of its own.
+            if n.nid != NID_MESSAGE_STORE {
+                assert_eq!(
+                    stream(&mut ost, n.bid_data),
+                    stream(&mut pst, m.bid_data),
+                    "node 0x{:X} holds different bytes",
+                    n.nid
+                );
+            }
             same_subtree(
                 &mut ost,
                 n.bid_sub,
@@ -557,6 +773,84 @@ mod tests {
             );
         }
         let _ = std::fs::remove_file(out);
+    }
+
+    /// Issue #1: the converted store must say where the folders are, and must not ask
+    /// for a password. Checked against the OST's own layout, and the entry id shape
+    /// against a store Outlook itself wrote.
+    #[test]
+    fn a_converted_store_points_at_the_mailbox_and_has_no_password() {
+        let (src, native) = ("tests/data/example-2013.ost", "tests/data/dist-list.pst");
+        if !std::path::Path::new(src).exists() || !std::path::Path::new(native).exists() {
+            eprintln!("skipping: run tests/fetch-fixtures.ps1");
+            return;
+        }
+        let bytes = |pc: &crate::ltp::Pc, id: u16| match pc.props.get(&id) {
+            Some(crate::ltp::Value::Bytes(b)) => b.clone(),
+            other => panic!("0x{id:04X} is {other:?}"),
+        };
+        let store = |p: &mut Pst| {
+            let n = p.nodes().into_iter().find(|n| n.nid == 0x21).unwrap();
+            read_node_pc(p, &n).expect("the store should read")
+        };
+        let entry = |key: &[u8], nid: u32| [&[0u8; 4][..], key, &nid.to_le_bytes()[..]].concat();
+
+        // The shape, from a file Outlook wrote: its subtree is node 0x8022.
+        let mut outlook = Pst::open(native).unwrap();
+        let pc = store(&mut outlook);
+        let key = bytes(&pc, PID_RECORD_KEY);
+        assert_eq!(bytes(&pc, PID_IPM_SUBTREE), entry(&key, 0x8022));
+
+        let mut ost = Pst::open(src).unwrap();
+        let nodes = ost.nodes();
+        let before = store(&mut ost);
+        assert_eq!(before.int(PID_PST_PASSWORD), Some(-1), "the OST carries -1");
+        assert!(!before.props.contains_key(&PID_IPM_SUBTREE));
+
+        let out = std::env::temp_dir().join("pstfree-store.pst");
+        let out = out.to_str().unwrap();
+        let r = convert(&mut ost, &nodes, out, &mut |_, _| {}).unwrap();
+        assert!(r.problems.is_empty(), "{:?}", r.problems);
+
+        let mut pst = Pst::open(out).unwrap();
+        let after = store(&mut pst);
+        let key = bytes(&after, PID_RECORD_KEY);
+        assert_eq!(after.int(PID_PST_PASSWORD), Some(0));
+        // Root - Mailbox\IPM_SUBTREE, its Deleted Items, and Root - Mailbox\Finder.
+        assert_eq!(bytes(&after, PID_IPM_SUBTREE), entry(&key, 0x2142));
+        assert_eq!(bytes(&after, PID_WASTEBASKET), entry(&key, 0x2162));
+        assert_eq!(bytes(&after, PID_FINDER), entry(&key, 0x20E2));
+        assert_eq!(after.int(PID_VALID_FOLDER_MASK), Some(0x89));
+        assert_eq!(after.str(PID_DISPLAY_NAME), Some("Personal Folders"));
+        // Everything else the OST's store held comes across unchanged.
+        let rewritten = [
+            PID_IPM_SUBTREE,
+            PID_WASTEBASKET,
+            PID_FINDER,
+            PID_VALID_FOLDER_MASK,
+            PID_PST_PASSWORD,
+            PID_DISPLAY_NAME,
+        ];
+        for (id, v) in before
+            .props
+            .iter()
+            .filter(|(id, _)| !rewritten.contains(id))
+        {
+            assert_eq!(
+                format!("{:?}", Some(v)),
+                format!("{:?}", after.props.get(id)),
+                "0x{id:04X} changed"
+            );
+        }
+        let _ = std::fs::remove_file(out);
+    }
+
+    #[test]
+    fn fill_levels_follow_the_spec_table() {
+        assert_eq!(fill_level(8000), 0);
+        assert_eq!(fill_level(3583), 1);
+        assert_eq!(fill_level(8), 14);
+        assert_eq!(fill_level(7), 15);
     }
 
     /// The two levels no fixture reaches: a stream too long for one XBLOCK, and a node

@@ -622,6 +622,12 @@ unsafe fn create_children(hwnd: HWND) {
         (ID_EXPORT_EML, "Export everything as &.eml..."),
         (ID_EXPORT_MBOX, "Export everything as m&box..."),
         (ID_EXPORT_MSG, "Export everything as .m&sg..."),
+        // The same job as Repair. Somebody converting an OST looks under Export for it,
+        // and the first person to do it for real said so (issue #1).
+        (
+            ID_REBUILD,
+            "Export everything as a .&pst (converts an OST)...",
+        ),
         (0, ""),
         (ID_EXPORT_FOLDER, "Export this &folder as .eml..."),
         (ID_EXPORT_MESSAGE, "Export this &message as .eml..."),
@@ -1289,7 +1295,8 @@ unsafe fn do_rebuild(hwnd: HWND, app: &mut App) {
                     if r.missing.is_empty() {
                         msg += "\n\nThe allocation maps go out marked invalid, which is the \
                             documented way to say 'rebuild these before writing'. Outlook \
-                            does that on open, and reopening the file here will report \
+                            reports such a file as not closed properly: run SCANPST over \
+                            it first, which takes seconds. Reopening it here will report \
                             that one thing on purpose.";
                     } else {
                         msg += &format!(
