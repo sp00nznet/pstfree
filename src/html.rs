@@ -323,6 +323,7 @@ pub fn decode(bytes: &[u8], codepage: Option<u32>) -> String {
 /// `MultiByteToWideChar`, refusing rather than guessing: an invalid sequence or a code
 /// page this machine does not have is `None`, so the caller falls back instead of
 /// showing a page of U+FFFD.
+#[cfg(windows)]
 fn windows(bytes: &[u8], cp: u32) -> Option<String> {
     use windows_sys::Win32::Globalization::{MultiByteToWideChar, MB_ERR_INVALID_CHARS};
     let len = i32::try_from(bytes.len()).ok()?;
@@ -341,6 +342,13 @@ fn windows(bytes: &[u8], cp: u32) -> Option<String> {
     let mut wide = vec![0u16; n as usize];
     let n = call(flags, wide.as_mut_ptr(), n);
     (n > 0).then(|| String::from_utf16_lossy(&wide[..n as usize]))
+}
+
+/// Off Windows (the browser demo, built for wasm32-unknown-emscripten) there is no code-page
+/// table to ask, so the rarer code pages fall back to cp1252 like an unknown one does.
+#[cfg(not(windows))]
+fn windows(_bytes: &[u8], _cp: u32) -> Option<String> {
+    None
 }
 
 fn cp1252(b: u8) -> char {
